@@ -75,3 +75,71 @@ def hybrid_retrieve(
     
     sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:k]
     return [(doc_map[did],rrf_scores[did]) for did in sorted_ids]
+
+#MMR
+async def mmr_retrieve(
+    query: str,
+    collection: str,
+    k: int,
+    lambda_mult: float = None,
+) -> list[tuple[Document, float]]:
+    """
+    Maximal Marginal Relevance: balance relevance vs diversity.
+    """
+    # 1. Setup parameters
+    lam = lambda_mult or settings.mmr_lambda
+    fetch_k = settings.top_k_retrieval
+    store = get_store(collection)
+
+    # 2. Get original scores to map them back later
+    # LangChain's MMR method doesn't return scores by default
+    pool = await store.asimilarity_search_with_relevance_scores(query, k=fetch_k)
+    score_map = {doc.metadata.get("doc_id"): score for doc, score in pool}
+
+    # 3. Perform the actual MMR search
+    mmr_docs = await store.amax_marginal_relevance_search(
+        query, 
+        k=k, 
+        fetch_k=fetch_k, 
+        lambda_mult=lam
+    )
+
+    # 4. Re-attach scores and return
+    return [
+        (doc, score_map.get(doc.metadata.get("doc_id"), 0.0))
+        for doc in mmr_docs
+    ]
+
+#cross encoder reranker
+class CrossEncoderReranker:
+    """
+    Lightweight reranker using a sentence-transformer cross-encoder.
+    Scores (query, passage) pairs directly — much more accurate than
+    bi-encoder similarity for final-stage ranking.
+
+    Falls back gracefully if sentence-transformers is not installed.
+    """
+    def __init__(self,model_name: str = "cross_encoder/ms-macro-MiniLM-L-6-v2"):
+        try:
+            from sentence_transformers import CrossEncoder
+            self.model = CrossEncoder(model_name)
+            self.available = True
+            logger.info(f"Cross-encoder loaded: {model_name}")
+        except ImportError:
+            self.available = False
+            logger.warning("sentence-transformers not installed - reranking disabled")
+
+    def rerank(
+        self,
+        query: str,
+        docs: list[tuple[Document,float]],
+        top_k: int,
+    ) -> list[tuple[Document,float]]:
+        if not self.available or not docs:
+            return docs[:top_k]
+        pairs = [(query, d.page_content) for d, _ in docs]
+        scores = self.model.predict(pairs)
+        ranked = sorted(zip(docs,scores), key=lambda x: x[1], reverse=True)
+        return [(doc, float(score)) for (doc, _), score in ranked[:top_k]]
+    
+_reranker = CrossEncoderReranker()
