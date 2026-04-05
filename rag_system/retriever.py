@@ -143,3 +143,23 @@ class CrossEncoderReranker:
         return [(doc, float(score)) for (doc, _), score in ranked[:top_k]]
     
 _reranker = CrossEncoderReranker()
+
+#Parent child context expansion
+def expand_to_parent_context(
+    docs: list[tuple[Document,float]],
+    collection: str
+) -> list[tuple[Document, float]]:
+    """
+    For each retrieved child chunk, stitch in prev/next chunks if available.
+    This gives the LLM wider context around the matched passage without
+    embedding huge parent documents.
+    """
+    store = get_store(collection)
+    if store is None:
+        return docs
+    
+    all_stored = store.docstore.dict #{faiss_id: Document}
+    by_doc_id = {d.metadata.get("doc_id"): d for d in all_stored.values()}
+
+    expanded = []
+    seen_ids
