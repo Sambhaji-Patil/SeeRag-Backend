@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -12,7 +12,7 @@ from langchain_community.document_loaders import (
     WebBaseLoader,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from config import get_settings
+from .config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

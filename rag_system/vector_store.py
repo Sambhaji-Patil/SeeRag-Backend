@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Optional
 
 import faiss
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from openai import embeddings
 
-from config import get_settings
-from embeddings import get_embeddings
+from .config import get_settings
+from .embeddings import get_embeddings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
