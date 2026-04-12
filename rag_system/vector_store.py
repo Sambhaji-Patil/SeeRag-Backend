@@ -76,7 +76,7 @@ def add_documents(
     
     #persist
     Path(path).mkdir(parents=True,exist_ok=True)
-    store.save_local(Path)
+    store.save_local(path)
     _stores[collection] = store
     logger.info(f"Index Saved at {path}")
     return store

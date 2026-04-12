@@ -9,16 +9,21 @@ Local embedding model: BAAI/bge-large-en-v1.5
 
 import asyncio
 import logging
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import numpy as np
-from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
+from pydantic.warnings import UnsupportedFieldAttributeWarning
 
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# Suppress known third-party warning noise triggered inside sentence-transformers stack.
+warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
 
 #thread pool for running blocking sentence-transformers calls
 #inside async contexts without blocking the event loop
@@ -26,19 +31,19 @@ settings = get_settings()
 _executor = ThreadPoolExecutor(max_workers=2)
 
 @lru_cache(maxsize=1)
-def get_embeddings() -> HuggingFaceBgeEmbeddings:
+def get_embeddings() -> HuggingFaceEmbeddings:
     """
     Singleton BGE embedding model
 
     encode_kwargs:
         normalize_embeddings=True -> required for BGE Cosine similarity to work correctly
     
-    query_instruction:
-        BGE was finetuned with a prefix on retrieval side,
-        Langchain's HFBEdding.. prepends it automatically when embed_query() is called, but NOT for embed_documents()
+    query_encode_kwargs:
+        BGE was finetuned with an instruction-like query prefix.
+        We pass that prefix for query encoding only; documents remain unchanged.
     """
     logger.info(f"Loading BGE model: {settings.embedding_model} on {settings.embedding_device}")
-    model = HuggingFaceBgeEmbeddings(
+    model = HuggingFaceEmbeddings(
         model_name = settings.embedding_model,
         model_kwargs={
             "device": settings.embedding_device,
@@ -47,7 +52,9 @@ def get_embeddings() -> HuggingFaceBgeEmbeddings:
             "normalize_embeddings": settings.embedding_normalize,
             "batch_size": settings.embedding_batch_size
         },
-        query_bgeinstructembedding = True, #this will enable auto query prefix
+        query_encode_kwargs={
+            "prompt": "Represent this sentence for searching relevant passages: ",
+        },
     )
     logger.info(f"BGE model loaded. Output dim={settings.embedding_dimensions}")
     return model

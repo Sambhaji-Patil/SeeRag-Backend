@@ -162,4 +162,65 @@ def expand_to_parent_context(
     by_doc_id = {d.metadata.get("doc_id"): d for d in all_stored.values()}
 
     expanded = []
-    seen_ids
+    seen_ids: set[str] = set()
+
+    for doc, score in docs:
+        did = doc.metadata.get("doc_id")
+        if did in seen_ids:
+            continue
+        seen_ids.add(did)
+
+        prev_id = doc.metadata.get("prev_chunk_id")
+        next_id = doc.metadata.get("next_chunk_id")
+
+        #stitch surrounding context
+        parts = []
+        if prev_id and prev_id in by_doc_id:
+            parts.append(by_doc_id[prev_id].page_content)
+        parts.append(doc.page_content)
+        if next_id and next_id in by_doc_id:
+            parts.append(by_doc_id[next_id].page_content)
+
+        expanded_doc = Document(
+            page_content="\n".join(parts),
+            metadata=doc.metadata,
+        )
+        expanded.append((expanded_doc, score))
+    
+    return expanded
+
+#Main retrieval entrypoint
+async def retrieve(
+    query: str,
+    collection: str = "default",
+    mode: str = "hybrid",
+    top_k: Optional[int] = None,
+    use_reranker: bool = True,
+    expand_context: bool = True,
+) -> list[tuple[Document,float]]:
+    k_retrieve = settings.top_k_retrieval
+    k_final = top_k or settings.top_k_rerank
+
+    if mode == "vector":
+        results = similarity_search_with_scores(query,collection,k=k_retrieve)
+    elif mode == "bm25":
+        results = bm25_retrieve(query,collection,k=k_retrieve)
+    elif mode == "mmr":
+        results = await mmr_retrieve(query,collection,k=k_final)
+        return results # MMR alrady handles diversity , skip reranker
+    else: #go with hybrid
+        results = hybrid_retrieve(query,collection,k=k_retrieve)
+
+    #Rerank
+    if use_reranker:
+        results = _reranker.rerank(query,collection,top_k=k_final)
+    else:
+        results = results[:k_final]
+    
+    # Expand to surrounding context(Parent-Child)
+    if expand_context:
+        results = expand_to_parent_context(results,collection)
+    
+    return results
+
+print("[retriever] Module ready")
