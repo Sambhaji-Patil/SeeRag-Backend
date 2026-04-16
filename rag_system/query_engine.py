@@ -66,3 +66,31 @@ async def hyde_query_expansion(query: str) -> str:
     )
     response = await _llm.ainvoke([HumanMessage(content=prompt)])
     return response.content.strip()
+
+# Context builder
+def build_context_block(docs_with_scores: list) -> tuple[str, list[SourceDocument]]:
+    """
+    Build the <context> prompt block and source list.
+    Wraps in XML tags to help the model distinguish context from instructions.
+    """
+    context_parts: list[str] = []
+    sources: list[SourceDocument] = []
+
+    for doc,score in docs_with_scores:
+        doc_id = doc.metadata.get("doc_id","unknown")
+        suspicious = check_context(doc.page_content)
+        content = doc.page_content
+        if suspicious:
+            content = redact_pii(content) # sanitize if suspicious
+        
+        context_parts.append(
+            f"<document id=\"{doc_id}\" score=\"{score:.3f}\">\n{content}\n</document>"
+        )
+        sources.append(SourceDocument(
+            doc_id=doc_id,
+            content=content[:300]+"..." if len(content) > 300 else content,
+            metadata=doc.metadata,
+            relevance_score=round(score,4),
+        ))
+    context_str = "<context>\n" + "\n\n".join(context_parts) + "\n</context>"
+    return context_str,sources
