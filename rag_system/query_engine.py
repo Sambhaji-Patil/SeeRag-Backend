@@ -94,3 +94,126 @@ def build_context_block(docs_with_scores: list) -> tuple[str, list[SourceDocumen
         ))
     context_str = "<context>\n" + "\n\n".join(context_parts) + "\n</context>"
     return context_str,sources
+
+#Main Query Pipeline
+async def query(
+    request: QueryRequest,
+    use_hyde: bool = False,
+) -> QueryResponse:
+    start = time.monotonic()
+
+    # 1. Input guardrail
+    guard = check_query(request.query)
+    if not guard.allowed:
+        return QueryResponse(
+            answer=f"Request blocked: {guard.reason}",
+            sources = [],
+            session_id=request.session_id,
+            latency_ms=0
+        )
+    
+    # 2. Exact cache check
+    cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
+    if cached:
+        cached["cached"] = True
+        cached["latency_ms"] = round((time.monotonic()-start)*1000,2)
+        return QueryResponse(**cached)
+    
+    # 3. Embed query for semantic cache + later retrieval
+    query_vec = await embed_query(request.query)
+    semantic_hit = get_semantic(query_vec)
+    if semantic_hit:
+        semantic_hit["cached"] = True
+        semantic_hit["latency_ms"] = round((time.monotonic()-start)*1000,2)
+        return QueryResponse(**semantic_hit)
+    
+    # 4. Resolve standalone question (multi-turn)
+    history = [h.model_dump() for h in request.history]
+    trimmed_history = trim_history_to_budget(history)
+    standalone = await resolve_standalone_question(request.query, trimmed_history, _llm)
+
+    # 5. Query rewrite / HyDE
+    if use_hyde:
+        retrieval_query = await hyde_query_expansion(standalone)
+    else:
+        retrieval_query = await rewrite_query(standalone)
+    
+    # 6. Retrieve
+    docs_with_scores = await retrieve(
+        query = retrieval_query,
+        collection = request.collection_name,
+        mode = request.retrieval_mode,
+        top_k = request.top_k,
+        use_reranker=True,
+        expand_context=True,
+    )
+
+    # 7. Build Prompt
+    context_str, sources = build_context_block(docs_with_scores)
+    user_message = (
+        f"{context_str}\n\n"
+        f"Question: {request.query}\n\n"
+        f"Answer based solely on the context above:"
+    )
+
+    messages = build_lc_messages(trimmed_history,SYSTEM_PROMPT)
+    messages.append(HumanMessage(content=user_message))
+
+    # 8. Generate
+    response = await _llm.ainvoke(messages)
+    answer = response.content.strip()
+
+    latency_ms = round((time.monotonic() - start)*1000,2)
+
+    result = QueryResponse(
+        answer = answer,
+        sources=sources,
+        session_id=request.session_id,
+        rewritten_query=retrieval_query if retrieval_query != request.query else None,
+        cached = False,
+        latency_ms=latency_ms
+    )
+
+    # 9. Cache the result
+    result_dict = result.model_dump()
+    set_exact(request.query, request.collection_name, request.retrieval_mode, result_dict)
+    set_semantic(query_vec,request.query, result_dict)
+
+    return result
+
+# Streaming variant
+async def stream_query(request: QueryRequest) -> AsyncIterator[str]:
+    """
+    SSE-compatible streaming answer generator.
+    Yields answer tokens as they arrive from OpenAI.
+    Sources are emitted as a final JSON event.
+    """
+    guard = check_query(request.query)
+    if not guard.allowed:
+        yield f"data: {guard.reason}\n\n"
+        return
+
+    standalone = await resolve_standalone_question(
+        request.query,
+        [h.model_dump() for h in request.history],
+        _llm,
+    )
+    retrieval_query = await rewrite_query(standalone)
+    docs_with_scores = await retrieve(
+        retrieval_query, request.collection_name, request.retrieval_mode.value
+    )
+    context_str, sources = build_context_block(docs_with_scores)
+    user_message = f"{context_str}\n\nQuestion: {request.query}\nAnswer:"
+
+    llm_stream = _build_llm(streamin=True)
+    async for chunk in llm_stream.astream([HumanMessage(content=user_message)]):
+        token = chunk.content
+        if token:
+            yield f"data: {token}\n\n"
+    
+    import json
+    sources_payload = [{"doc_id":s.doc_id, "score":s.relevance_score} for s in sources]
+    yield f"data: [SOURCES]{json.dumps(sources_payload)}\n\n"
+    yield "data: [DONE]\n\n"
+
+print("[query_engine] Module ready")
