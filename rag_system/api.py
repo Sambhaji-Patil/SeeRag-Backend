@@ -45,3 +45,30 @@ app = FastAPI(
     description="Production RAG system: ingest documents, query with advanced retrieval",
     lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Request timing middleware
+@app.middleware("http")
+async def add_process_time_header(request,call_next):
+    start = time.monotonic()
+    response = await call_next(request)
+    duration_ms = round((time.monotonic()-start)*1000,2)
+    response.headers["X-Process-Time-Ms"] = str(duration_ms)
+    return response
+
+# Helath
+@app.get("/health",response_model=HealthResponse,tags=["ops"])
+async def health():
+    return HealthResponse(
+        status="ok",
+        vector_store_loaded=is_loaded("default"),
+        cache_connected=cache_connected(),
+        model=settings.chat_model
+    )
