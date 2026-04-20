@@ -113,4 +113,19 @@ def cache_connected() -> bool:
     except Exception:
         return False
 
+def get_cache_stats() -> dict:
+    stats = {}
+    if isinstance(_cache_client, InMemoryCache):
+        stats["system"] = "in-memory (python dictionary)"
+        stats["exact_matches_cached"] = len(_cache_client._store)
+    else:
+        stats["system"] = "redis"
+        try:
+            stats["exact_matches_cached"] = _cache_client.dbsize()
+        except:
+            stats["exact_matches_cached"] = "unknown"
+            
+    stats["semantic_matches_cached"] = len(_semantic_index)
+    return stats
+
 print("[cache] Module ready")

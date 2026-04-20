@@ -19,11 +19,15 @@ from .document_processor import process_texts,process_file
 from .vector_store import add_documents, load_or_create_store, is_loaded
 from .query_engine import query as run_query, stream_query
 from .eval import evaluate
-from .cache import cache_connected
+from .cache import cache_connected, get_cache_stats
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler("system_logs.txt", mode="w", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -72,6 +76,11 @@ async def health():
         cache_connected=cache_connected(),
         model=settings.chat_model
     )
+
+@app.get("/cache_stats", tags=["ops"])
+async def cache_stats():
+    """Information about where the cache is stored and how many queries have been cached"""
+    return get_cache_stats()
 
 # Ingest raw texts 
 @app.post("/ingest", response_model=IngestResponse, tags=["ingest"])

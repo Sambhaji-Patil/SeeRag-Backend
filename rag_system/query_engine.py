@@ -115,6 +115,7 @@ async def query(
     # 2. Exact cache check
     cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
     if cached:
+        logger.info(f"Exact cache hit for query: '{request.query}'")
         cached["cached"] = True
         cached["latency_ms"] = round((time.monotonic()-start)*1000,2)
         return QueryResponse(**cached)
@@ -123,6 +124,7 @@ async def query(
     query_vec = await embed_query(request.query)
     semantic_hit = get_semantic(query_vec)
     if semantic_hit:
+        logger.info(f"Semantic cache hit for query: '{request.query}'")
         semantic_hit["cached"] = True
         semantic_hit["latency_ms"] = round((time.monotonic()-start)*1000,2)
         return QueryResponse(**semantic_hit)
@@ -155,6 +157,16 @@ async def query(
         f"Question: {request.query}\n\n"
         f"Answer based solely on the context above:"
     )
+
+    try:
+        import os
+        os.makedirs("context", exist_ok=True)
+        with open("context/query_context.txt", "w", encoding="utf-8") as f:
+            f.write(f"--- Original Query ---\n{request.query}\n\n")
+            f.write(f"--- Rewritten Query ---\n{retrieval_query}\n\n")
+            f.write(f"--- Final Context ---\n{context_str}\n")
+    except Exception as e:
+        logger.warning(f"Failed to write query context to file: {e}")
 
     messages = build_lc_messages(trimmed_history,SYSTEM_PROMPT)
     messages.append(HumanMessage(content=user_message))
