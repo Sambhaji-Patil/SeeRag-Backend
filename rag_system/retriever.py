@@ -11,12 +11,12 @@ import logging
 from typing import Optional
 
 import numpy as np
-from langchain.schema import Document
+from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
-from config import get_settings
-from embeddings import embed_query, cosine_similarity
-from vector_store import similarity_search_with_scores, get_store
+from .config import get_settings
+from .embeddings import embed_query, cosine_similarity
+from .vector_store import similarity_search_with_scores, get_store
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -119,7 +119,7 @@ class CrossEncoderReranker:
 
     Falls back gracefully if sentence-transformers is not installed.
     """
-    def __init__(self,model_name: str = "cross_encoder/ms-macro-MiniLM-L-6-v2"):
+    def __init__(self,model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
         try:
             from sentence_transformers import CrossEncoder
             self.model = CrossEncoder(model_name)
@@ -158,7 +158,7 @@ def expand_to_parent_context(
     if store is None:
         return docs
     
-    all_stored = store.docstore.dict #{faiss_id: Document}
+    all_stored = store.docstore._dict #{faiss_id: Document}
     by_doc_id = {d.metadata.get("doc_id"): d for d in all_stored.values()}
 
     expanded = []
@@ -213,7 +213,7 @@ async def retrieve(
 
     #Rerank
     if use_reranker:
-        results = _reranker.rerank(query,collection,top_k=k_final)
+        results = _reranker.rerank(query,results,top_k=k_final)
     else:
         results = results[:k_final]
     

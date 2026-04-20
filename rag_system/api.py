@@ -8,18 +8,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
 
-from config import get_settings
-from models import (
+from .config import get_settings
+from .models import (
     IngestRequest,IngestResponse,
     QueryRequest,QueryResponse,
     EvalRequest,EvalResponse,
     HealthResponse
 )
-from document_processor import process_texts,process_file
-from vector_store import add_documents, load_or_create_store, is_loaded
-from query_engine import query as run_query, stream_query
-from eval import evaluate
-from cache import cache_connected
+from .document_processor import process_texts,process_file
+from .vector_store import add_documents, load_or_create_store, is_loaded
+from .query_engine import query as run_query, stream_query
+from .eval import evaluate
+from .cache import cache_connected
 
 logging.basicConfig(
     level=logging.INFO,
@@ -190,7 +190,7 @@ async def evaluate_endpoint(req: EvalRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "api:app",
+        "rag_system.api:app",
         host="0.0.0.0",
         port=8000,
         reload=True,

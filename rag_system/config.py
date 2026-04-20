@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     answer_relevance_threshold: float = 0.7
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.path.join(os.path.dirname(__file__), ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False
     )

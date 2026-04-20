@@ -13,10 +13,10 @@ import logging
 from typing import Optional
 
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage
+from langchain_core.messages import HumanMessage
 
-from config import get_settings
-from models import EvalRequest, EvalResponse
+from .config import get_settings
+from .models import EvalRequest, EvalResponse
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

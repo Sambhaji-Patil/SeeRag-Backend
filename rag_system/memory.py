@@ -8,10 +8,10 @@ Compression kicks in when history exceeds the token budget
 import logging
 import tiktoken
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
-from config import get_settings
-from prompt import STANDALONE_QUESTION_PROMPT
+from .config import get_settings
+from .prompt import STANDALONE_QUESTION_PROMPT
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

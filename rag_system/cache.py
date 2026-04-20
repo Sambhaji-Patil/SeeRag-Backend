@@ -16,8 +16,8 @@ from typing import Optional
 from google_crc32c import value
 import numpy as np
 
-from config import get_settings
-from embeddings import cosine_similarity
+from .config import get_settings
+from .embeddings import cosine_similarity
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
