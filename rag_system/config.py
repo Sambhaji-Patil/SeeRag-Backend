@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["*"]
     rate_limit_per_minute: int = 60
 
+    #guardrails
+    guardrails_use_llama_guard: bool = True
+    guardrails_model_id: str = "meta-llama/Llama-Guard-3-1B"
+    guardrails_max_new_tokens: int = 32
+    guardrails_local_model_path: str | None = None
+    guardrails_local_files_only: bool = True
+    guardrails_download_if_missing: bool = True
+    hf_token: str | None = None
+
     #evaluation
     faithfullness_threshold: float = 0.7
     answer_relevance_threshold: float = 0.7
