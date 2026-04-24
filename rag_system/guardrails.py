@@ -87,6 +87,62 @@ _INJECTION_PATTERNS = [
 ]
 _INJECTION_RE = re.compile("|".join(_INJECTION_PATTERNS),re.IGNORECASE)
 
+# Weighted risk signals used when Llama Guard returns unsafe.
+_RISK_INTENT_SIGNALS = [
+    (re.compile(r"\b(bomb|explosive|detonat(e|or)|ied|gun|rifle|pistol|weapon)\b", re.IGNORECASE), 0.60, "weapons_or_explosives"),
+    (re.compile(r"\b(kill|murder|assassin|poison|harm\s+someone)\b", re.IGNORECASE), 0.60, "violent_harm"),
+    (re.compile(r"\b(hack|malware|ransomware|phishing|ddos|sql\s*injection)\b", re.IGNORECASE), 0.55, "cyber_abuse"),
+    (re.compile(r"\b(drug\s+lab|meth|cocaine|heroin|make\s+drugs?)\b", re.IGNORECASE), 0.55, "illicit_drugs"),
+    (re.compile(r"\b(child\s+abuse|sexual\s+assault|terror(ism|ist)?)\b", re.IGNORECASE), 0.75, "extreme_harm"),
+    (re.compile(r"\b(piracy|pirated|torrent|crack(ed)?|warez|illegal\s+download|stream\s+for\s+free)\b", re.IGNORECASE), 0.40, "piracy_infringement"),
+    (re.compile(r"\b(copyright\s+infringement|bypass\s+(paywall|license)|stolen\s+software)\b", re.IGNORECASE), 0.40, "copyright_evasion"),
+    (re.compile(r"\b(launder(ing)?\s+money|money\s+launder(ing)?|wash\s+money)\b", re.IGNORECASE), 0.55, "money_laundering"),
+    (re.compile(r"\b(financial\s+fraud|tax\s+evasion|insider\s+trading|ponzi|embezzle(ment)?)\b", re.IGNORECASE), 0.50, "financial_crime"),
+    (re.compile(r"\b(rob|robbing|robbery|heist|steal|stolen|burglary|rob\s+a\s+bank|bank\s+robbery)\b", re.IGNORECASE), 0.55, "theft_or_robbery"),
+]
+
+_SAFETY_INTENT_SIGNALS = [
+    (re.compile(r"\b(defend|protect|prevent|avoid|escape|report|survive|safety|self[-\s]?defen[cs]e)\b", re.IGNORECASE), -0.25, "safety_intent"),
+    (re.compile(r"\b(help\s+me\s+(stay|be)\s+safe|how\s+to\s+stay\s+safe)\b", re.IGNORECASE), -0.20, "explicit_safety_request"),
+]
+
+_LLAMA_GUARD_CATEGORY_WEIGHTS = {
+    "S1": 0.15,
+    "S2": 0.35,
+    "S3": 0.35,
+    "S4": 0.55,
+    "S5": 0.60,
+    "S6": 0.45,
+    "S7": 0.55,
+    "S8": 0.25,
+    "S9": 0.65,
+    "S10": 0.45,
+    "S11": 0.60,
+}
+
+
+def _compute_llama_guard_risk(query: str, verdict: str) -> tuple[float, list[str]]:
+    score = settings.guardrails_unsafe_base_score
+    reasons: list[str] = ["unsafe_base"]
+
+    category_codes = {code.upper() for code in re.findall(r"\bS\d{1,2}\b", verdict, flags=re.IGNORECASE)}
+    for code in sorted(category_codes):
+        if code in _LLAMA_GUARD_CATEGORY_WEIGHTS:
+            score += _LLAMA_GUARD_CATEGORY_WEIGHTS[code]
+            reasons.append(f"llamaguard_{code}")
+
+    for pattern, weight, label in _RISK_INTENT_SIGNALS:
+        if pattern.search(query):
+            score += weight
+            reasons.append(label)
+
+    for pattern, weight, label in _SAFETY_INTENT_SIGNALS:
+        if pattern.search(query):
+            score += weight
+            reasons.append(label)
+
+    return max(0.0, min(score, 1.0)), reasons
+
 # PII patterns (basic)
 _PII_PATTERNS = {
     "email": re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
@@ -220,10 +276,12 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
             conversation,
             return_tensors="pt",
         ).to(_llama_guard_model.device)
+        attention_mask = input_ids.new_ones(input_ids.shape)
 
         prompt_len = input_ids.shape[1]
         output = _llama_guard_model.generate(
             input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=settings.guardrails_max_new_tokens,
             pad_token_id=_llama_guard_tokenizer.eos_token_id or 0,
         )
@@ -234,10 +292,41 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
         ).strip()
 
         verdict_lower = verdict.lower()
-        if "unsafe" in verdict_lower:
-            reason = f"Llama Guard blocked query: {verdict}"
-            logger.warning("Blocked by Llama Guard | query='%s' | verdict='%s'", query, verdict)
-            return GuardrailResult(allowed=False, reason=reason)
+        verdict_lines = [line.strip().lower() for line in verdict.splitlines() if line.strip()]
+        primary_verdict = verdict_lines[0] if verdict_lines else verdict_lower
+        is_unsafe = primary_verdict.startswith("unsafe")
+
+        if is_unsafe:
+            if not settings.guardrails_require_harm_intent_for_llama_unsafe:
+                reason = f"Llama Guard blocked query: {verdict}"
+                logger.warning("Blocked by Llama Guard | query='%s' | verdict='%s'", query, verdict)
+                return GuardrailResult(allowed=False, reason=reason)
+
+            risk_score, risk_reasons = _compute_llama_guard_risk(query, verdict)
+            if risk_score >= settings.guardrails_risk_block_threshold:
+                reason = (
+                    f"Llama Guard blocked query (risk={risk_score:.2f}, threshold={settings.guardrails_risk_block_threshold:.2f}): "
+                    f"{verdict}"
+                )
+                logger.warning(
+                    "Blocked by weighted Llama Guard policy | query='%s' | verdict='%s' | risk=%.2f | reasons=%s",
+                    query,
+                    verdict,
+                    risk_score,
+                    ",".join(risk_reasons),
+                )
+                return GuardrailResult(allowed=False, reason=reason)
+
+            logger.warning(
+                "Llama Guard returned unsafe but risk below threshold; allowing query | "
+                "query='%s' | verdict='%s' | risk=%.2f | threshold=%.2f | reasons=%s",
+                query,
+                verdict,
+                risk_score,
+                settings.guardrails_risk_block_threshold,
+                ",".join(risk_reasons),
+            )
+            return GuardrailResult(allowed=True, sanitized_text=query)
 
         logger.info("Llama Guard passed query | verdict='%s'", verdict)
         return GuardrailResult(allowed=True, sanitized_text=query)

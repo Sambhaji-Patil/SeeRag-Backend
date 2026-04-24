@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     context_window_tokens: int = 8000
 
     #cache
+    cache_enabled: bool = False
     redis_url: str = "redis://localhost:6379"
     cache_ttl_seconds: int = 3600
     semantic_cache_threshold: float = 0.95
@@ -54,6 +55,9 @@ class Settings(BaseSettings):
     guardrails_local_model_path: str | None = None
     guardrails_local_files_only: bool = True
     guardrails_download_if_missing: bool = True
+    guardrails_require_harm_intent_for_llama_unsafe: bool = True
+    guardrails_risk_block_threshold: float = 0.60
+    guardrails_unsafe_base_score: float = 0.20
     hf_token: str | None = None
 
     #evaluation
