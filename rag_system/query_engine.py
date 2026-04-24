@@ -8,6 +8,7 @@ Core RAG query pipeline:
 6. Return answer + sources
 """
 import logging
+import re
 import time
 from typing import AsyncIterator, Optional
 
@@ -39,6 +40,17 @@ def _build_llm(streaming: bool = False) -> ChatOpenAI:
     )
 
 _llm = _build_llm()
+
+_SECTION_REF_RE = re.compile(r"\b\d+\.\d+\b")
+_SECTION_HINT_RE = re.compile(r"\b(section|clause|exclusion|code|excl)\b", re.IGNORECASE)
+
+
+def _should_preserve_exact_reference(query: str) -> bool:
+    """
+    Preserve exact retrieval query when user asks about numbered clauses/sections,
+    e.g. "7.14 exclusion". Rewriting often dilutes these anchors.
+    """
+    return bool(_SECTION_REF_RE.search(query) and _SECTION_HINT_RE.search(query))
 
 # Query rewriting
 async def rewrite_query(query: str) -> str:
@@ -113,21 +125,23 @@ async def query(
         )
     
     # 2. Exact cache check
-    cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
-    if cached:
-        logger.info(f"Exact cache hit for query: '{request.query}'")
-        cached["cached"] = True
-        cached["latency_ms"] = round((time.monotonic()-start)*1000,2)
-        return QueryResponse(**cached)
+    if settings.cache_enabled:
+        cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
+        if cached:
+            logger.info(f"Exact cache hit for query: '{request.query}'")
+            cached["cached"] = True
+            cached["latency_ms"] = round((time.monotonic()-start)*1000,2)
+            return QueryResponse(**cached)
     
     # 3. Embed query for semantic cache + later retrieval
     query_vec = await embed_query(request.query)
-    semantic_hit = get_semantic(query_vec)
-    if semantic_hit:
-        logger.info(f"Semantic cache hit for query: '{request.query}'")
-        semantic_hit["cached"] = True
-        semantic_hit["latency_ms"] = round((time.monotonic()-start)*1000,2)
-        return QueryResponse(**semantic_hit)
+    if settings.cache_enabled:
+        semantic_hit = get_semantic(query_vec)
+        if semantic_hit:
+            logger.info(f"Semantic cache hit for query: '{request.query}'")
+            semantic_hit["cached"] = True
+            semantic_hit["latency_ms"] = round((time.monotonic()-start)*1000,2)
+            return QueryResponse(**semantic_hit)
     
     # 4. Resolve standalone question (multi-turn)
     history = [h.model_dump() for h in request.history]
@@ -135,7 +149,10 @@ async def query(
     standalone = await resolve_standalone_question(request.query, trimmed_history, _llm)
 
     # 5. Query rewrite / HyDE
-    if use_hyde:
+    if _should_preserve_exact_reference(standalone):
+        retrieval_query = standalone
+        logger.info("Skipping query rewrite to preserve section/clause reference: '%s'", standalone)
+    elif use_hyde:
         retrieval_query = await hyde_query_expansion(standalone)
     else:
         retrieval_query = await rewrite_query(standalone)
@@ -187,9 +204,10 @@ async def query(
     )
 
     # 9. Cache the result
-    result_dict = result.model_dump()
-    set_exact(request.query, request.collection_name, request.retrieval_mode, result_dict)
-    set_semantic(query_vec,request.query, result_dict)
+    if settings.cache_enabled:
+        result_dict = result.model_dump()
+        set_exact(request.query, request.collection_name, request.retrieval_mode, result_dict)
+        set_semantic(query_vec,request.query, result_dict)
 
     return result
 
@@ -210,7 +228,11 @@ async def stream_query(request: QueryRequest) -> AsyncIterator[str]:
         [h.model_dump() for h in request.history],
         _llm,
     )
-    retrieval_query = await rewrite_query(standalone)
+    if _should_preserve_exact_reference(standalone):
+        retrieval_query = standalone
+        logger.info("Skipping query rewrite to preserve section/clause reference: '%s'", standalone)
+    else:
+        retrieval_query = await rewrite_query(standalone)
     docs_with_scores = await retrieve(
         retrieval_query, request.collection_name, request.retrieval_mode.value
     )
