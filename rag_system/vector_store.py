@@ -78,6 +78,13 @@ def add_documents(
     Path(path).mkdir(parents=True,exist_ok=True)
     store.save_local(path)
     _stores[collection] = store
+    
+    # Prebuild BM25 index on ingest
+    from .retriever import _bm25_cache, _get_bm25
+    if collection in _bm25_cache:
+        del _bm25_cache[collection]
+    _get_bm25(collection)
+    
     logger.info(f"Index Saved at {path}")
     return store
 

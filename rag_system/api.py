@@ -20,6 +20,9 @@ from .vector_store import add_documents, load_or_create_store, is_loaded
 from .query_engine import query as run_query, stream_query
 from .eval import evaluate
 from .cache import cache_connected, get_cache_stats
+from .embeddings import get_embeddings
+from .guardrails import _load_llama_guard
+from .retriever import _reranker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +39,15 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting RAG API...")
+    
+    logger.info("Preloading models...")
+    get_embeddings()
+    _load_llama_guard()
+    if getattr(_reranker, "available", False):
+        logger.info("Reranker model preloaded")
+    else:
+        logger.info("Reranker unavailable; skipping preload")
+    
     # Preload any existing FAISS Indexes on disk
     from pathlib import Path
     base_path = Path(settings.faiss_index_path)

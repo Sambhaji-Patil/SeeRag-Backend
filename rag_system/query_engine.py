@@ -167,6 +167,21 @@ async def query(
         expand_context=True,
     )
 
+    if not docs_with_scores:
+        latency_ms = round((time.monotonic() - start) * 1000, 2)
+        clarify = (
+            "Can you clarify your question with a bit more detail "
+            "(topic, document name, section, or timeframe)?"
+        )
+        return QueryResponse(
+            answer=clarify,
+            sources=[],
+            session_id=request.session_id,
+            rewritten_query=retrieval_query if retrieval_query != request.query else None,
+            cached=False,
+            latency_ms=latency_ms,
+        )
+
     # 7. Build Prompt
     context_str, sources = build_context_block(docs_with_scores)
     user_message = (
