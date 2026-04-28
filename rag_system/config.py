@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     guardrails_local_files_only: bool = True
     guardrails_download_if_missing: bool = True
     guardrails_require_harm_intent_for_llama_unsafe: bool = True
-    guardrails_risk_block_threshold: float = 0.60
+    guardrails_risk_block_threshold: float = 0.50
     guardrails_unsafe_base_score: float = 0.20
     hf_token: str | None = None
 
