@@ -36,8 +36,13 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting RAG API...")
-    # Here we will pre load default FAISS Index if it exists on disk
-    load_or_create_store("default")
+    # Preload any existing FAISS Indexes on disk
+    from pathlib import Path
+    base_path = Path(settings.faiss_index_path)
+    if base_path.exists():
+        for d in base_path.iterdir():
+            if d.is_dir():
+                load_or_create_store(d.name)
     logger.info("RAG API ready!")
     yield
     logger.info("Shutting down RAG API")
@@ -72,7 +77,7 @@ async def add_process_time_header(request,call_next):
 async def health():
     return HealthResponse(
         status="ok",
-        vector_store_loaded=is_loaded("default"),
+        vector_store_loaded=is_loaded(None),
         cache_connected=cache_connected(),
         model=settings.chat_model
     )

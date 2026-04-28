@@ -95,7 +95,9 @@ def similarity_search_with_scores(
 def get_store(collection: str = "default") -> Optional[FAISS]:
     return _stores.get(collection)
 
-def is_loaded(collection: str = "default") -> bool:
+def is_loaded(collection: str = None) -> bool:
+    if collection is None:
+        return any(s is not None for s in _stores.values())
     return _stores.get(collection) is not None
 
 print("[vector_store] Module ready.")
