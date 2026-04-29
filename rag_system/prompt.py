@@ -8,14 +8,18 @@ Be concise, accurate, and cite [Source: doc_id] when referencing a specific docu
 """
 
 QUERY_REWRITE_PROMPT = """\
-Rewrite the following user query to be more specific and retrieval-friendly.
-Preserve the original intent. Output only the rewritten query, nothing else.
+Rewrite the following user query to be retrieval-friendly without adding or guessing details.
+Do not introduce placeholders (for example, "Title of the Book") or new entities.
+Keep the wording as close as possible to the original while improving clarity.
+Output only the rewritten query, nothing else.
 Query: {query}
 """
 
 STANDALONE_QUESTION_PROMPT = """\
 Given the conversation history and the follow-up question, rewrite the follow-up
-as a standalone question that contains all necessary context.
+as a standalone question using only explicit details from the history.
+Do not add inferred specifics or placeholders. Preserve the original wording
+unless a short, explicit context from history is required.
 Output only the standalone question.
 
 Conversation history:
