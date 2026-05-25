@@ -1,0 +1,77 @@
+name: Sync rag_system to HF Space
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rag_system/**"
+      - "requirements.txt"
+      - "Dockerfile"
+      - "README.md"
+      - ".github/workflows/hf-sync.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: hf-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install huggingface_hub
+
+      - name: Upload rag_system to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+          HF_SPACE_PATH: "rag_system"
+          HF_PATH_IN_REPO: "."
+        run: |
+          python - <<'PY'
+          import os
+          from huggingface_hub import upload_folder, upload_file
+
+          token = os.environ["HF_TOKEN"]
+          repo_id = os.environ["HF_SPACE_ID"]
+          folder_path = os.environ.get("HF_SPACE_PATH", "rag_system")
+          path_in_repo = os.environ.get("HF_PATH_IN_REPO", ".")
+
+          if not os.path.isdir(folder_path):
+              raise SystemExit(f"Folder not found: {folder_path}")
+
+            upload_folder(
+              repo_id=repo_id,
+              folder_path=folder_path,
+              path_in_repo=path_in_repo,
+              repo_type="space",
+              token=token,
+              ignore_patterns=[
+                  "**/__pycache__/**",
+                  "**/*.pyc",
+                  "**/.DS_Store",
+              ],
+          )
+
+            for extra in ("requirements.txt", "Dockerfile", "README.md"):
+              if os.path.isfile(extra):
+                upload_file(
+                  repo_id=repo_id,
+                  path_or_fileobj=extra,
+                  path_in_repo=extra,
+                  repo_type="space",
+                  token=token,
+                )
+          print(f"Uploaded {folder_path} to {repo_id} ({path_in_repo})")
+          PY
