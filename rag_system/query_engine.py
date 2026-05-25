@@ -226,6 +226,190 @@ async def query(
 
     return result
 
+# Pipeline-events streaming variant (step-by-step SSE for frontend animation)
+async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
+    """
+    Yields structured SSE JSON events for every step of the RAG pipeline,
+    then streams LLM tokens one-by-one. Designed to drive frontend animations.
+
+    Event types: pipeline_start, guardrail_check, cache_check, query_rewrite,
+                 retrieval_start, chunks_retrieved, context_built,
+                 generation_start, token, complete
+    """
+    import json
+
+    def emit(event: str, status: str, data: dict = None) -> str:
+        payload = {"event": event, "status": status, "data": data or {}}
+        return f"data: {json.dumps(payload)}\n\n"
+
+    start = time.monotonic()
+    mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
+
+    yield emit("pipeline_start", "in_progress", {
+        "query": request.query,
+        "collection": request.collection_name,
+        "mode": mode_val,
+    })
+
+    # --- Guardrail check ---
+    guard = check_query(request.query)
+    if not guard.allowed:
+        yield emit("guardrail_check", "blocked", {"reason": guard.reason})
+        yield emit("complete", "blocked", {
+            "answer": f"Request blocked: {guard.reason}",
+            "sources": [],
+            "latency_ms": round((time.monotonic() - start) * 1000, 2),
+        })
+        yield "data: [DONE]\n\n"
+        return
+    yield emit("guardrail_check", "passed", {})
+
+    # --- Cache check ---
+    query_vec = None
+    if settings.cache_enabled:
+        cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
+        if cached:
+            cached["cached"] = True
+            cached["latency_ms"] = round((time.monotonic() - start) * 1000, 2)
+            yield emit("cache_check", "hit", {"type": "exact"})
+            yield emit("complete", "done", cached)
+            yield "data: [DONE]\n\n"
+            return
+
+        query_vec = await embed_query(request.query)
+        semantic_hit = get_semantic(query_vec)
+        if semantic_hit:
+            semantic_hit["cached"] = True
+            semantic_hit["latency_ms"] = round((time.monotonic() - start) * 1000, 2)
+            yield emit("cache_check", "hit", {"type": "semantic"})
+            yield emit("complete", "done", semantic_hit)
+            yield "data: [DONE]\n\n"
+            return
+        yield emit("cache_check", "miss", {})
+    else:
+        yield emit("cache_check", "skipped", {})
+
+    # --- Standalone question resolution (multi-turn) ---
+    history = [h.model_dump() for h in request.history]
+    trimmed_history = trim_history_to_budget(history)
+    standalone = await resolve_standalone_question(request.query, trimmed_history, _llm)
+
+    # --- Query rewrite ---
+    if _should_preserve_exact_reference(standalone):
+        retrieval_query = standalone
+        yield emit("query_rewrite", "skipped", {
+            "reason": "section/clause reference preserved",
+            "query": standalone,
+        })
+    else:
+        retrieval_query = await rewrite_query(standalone)
+        yield emit("query_rewrite", "done", {
+            "original": request.query,
+            "rewritten": retrieval_query,
+        })
+
+    # --- Retrieval ---
+    yield emit("retrieval_start", "in_progress", {
+        "mode": mode_val,
+        "top_k": request.top_k or settings.top_k_retrieval,
+    })
+
+    docs_with_scores = await retrieve(
+        query=retrieval_query,
+        collection=request.collection_name,
+        mode=request.retrieval_mode,
+        top_k=request.top_k,
+        use_reranker=True,
+        expand_context=True,
+    )
+
+    if not docs_with_scores:
+        yield emit("chunks_retrieved", "empty", {"count": 0})
+        yield emit("complete", "done", {
+            "answer": "Can you clarify your question with a bit more detail (topic, document name, section, or timeframe)?",
+            "sources": [],
+            "rewritten_query": retrieval_query,
+            "latency_ms": round((time.monotonic() - start) * 1000, 2),
+            "session_id": request.session_id,
+            "cached": False,
+        })
+        yield "data: [DONE]\n\n"
+        return
+
+    chunk_previews = [
+        {
+            "doc_id": doc.metadata.get("doc_id", "unknown")[:12],
+            "score": round(score, 4),
+            "preview": doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content,
+            "source": doc.metadata.get("source_id", doc.metadata.get("source", "unknown")),
+            "chunk_index": doc.metadata.get("chunk_index", 0),
+        }
+        for doc, score in docs_with_scores
+    ]
+    yield emit("chunks_retrieved", "done", {
+        "count": len(docs_with_scores),
+        "chunks": chunk_previews,
+    })
+
+    # --- Context building ---
+    context_str, sources = build_context_block(docs_with_scores)
+    estimated_tokens = len(context_str) // 4
+
+    yield emit("context_built", "done", {
+        "chunks_used": len(sources),
+        "estimated_tokens": estimated_tokens,
+        "sources": [{"doc_id": s.doc_id, "score": s.relevance_score} for s in sources],
+    })
+
+    # --- LLM generation ---
+    user_message = (
+        f"{context_str}\n\n"
+        f"Question: {request.query}\n\n"
+        f"Answer based solely on the context above:"
+    )
+    messages = build_lc_messages(trimmed_history, SYSTEM_PROMPT)
+    messages.append(HumanMessage(content=user_message))
+
+    yield emit("generation_start", "in_progress", {"model": settings.chat_model})
+
+    llm_stream = _build_llm(streaming=True)
+    full_answer = ""
+    async for chunk in llm_stream.astream(messages):
+        token = chunk.content
+        if token:
+            full_answer += token
+            yield f"data: {json.dumps({'event': 'token', 'status': 'in_progress', 'data': {'text': token}})}\n\n"
+
+    latency_ms = round((time.monotonic() - start) * 1000, 2)
+    sources_data = [s.model_dump() for s in sources]
+
+    # Cache result
+    if settings.cache_enabled:
+        result_dict = {
+            "answer": full_answer,
+            "sources": sources_data,
+            "session_id": request.session_id,
+            "rewritten_query": retrieval_query if retrieval_query != request.query else None,
+            "cached": False,
+            "latency_ms": latency_ms,
+            "eval_scores": None,
+        }
+        if query_vec is None:
+            query_vec = await embed_query(request.query)
+        set_exact(request.query, request.collection_name, request.retrieval_mode, result_dict)
+        set_semantic(query_vec, request.query, result_dict)
+
+    yield emit("complete", "done", {
+        "answer": full_answer,
+        "sources": sources_data,
+        "rewritten_query": retrieval_query if retrieval_query != request.query else None,
+        "latency_ms": latency_ms,
+        "session_id": request.session_id,
+        "cached": False,
+    })
+    yield "data: [DONE]\n\n"
+
+
 # Streaming variant
 async def stream_query(request: QueryRequest) -> AsyncIterator[str]:
     """
@@ -254,7 +438,7 @@ async def stream_query(request: QueryRequest) -> AsyncIterator[str]:
     context_str, sources = build_context_block(docs_with_scores)
     user_message = f"{context_str}\n\nQuestion: {request.query}\nAnswer:"
 
-    llm_stream = _build_llm(streamin=True)
+    llm_stream = _build_llm(streaming=True)
     async for chunk in llm_stream.astream([HumanMessage(content=user_message)]):
         token = chunk.content
         if token:
