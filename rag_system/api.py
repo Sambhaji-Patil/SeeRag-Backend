@@ -1,23 +1,28 @@
 import logging
 import time
+import uuid as _uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
 
 from .config import get_settings
 from .models import (
-    IngestRequest,IngestResponse,
-    QueryRequest,QueryResponse,
-    EvalRequest,EvalResponse,
-    HealthResponse
+    IngestRequest, IngestResponse,
+    QueryRequest, QueryResponse,
+    EvalRequest, EvalResponse,
+    HealthResponse,
 )
-from .document_processor import process_texts,process_file
-from .vector_store import add_documents, load_or_create_store, is_loaded
-from .query_engine import query as run_query, stream_query
+from .document_processor import process_texts, process_file
+from .vector_store import (
+    add_documents, load_or_create_store, is_loaded,
+    list_collections, get_collection_stats, delete_collection,
+    cleanup_stale_collections,
+)
+from .query_engine import query as run_query, stream_query, pipeline_stream_query
 from .eval import evaluate
 from .cache import cache_connected, get_cache_stats
 from .embeddings import get_embeddings
@@ -29,17 +34,21 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
         logging.FileHandler("system_logs.txt", mode="w", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Lifespan (startup/shutdown)
+# In-memory job registry for background ingestion tasks
+_ingest_jobs: dict[str, dict] = {}
+
+
+# Lifespan (startup / shutdown)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting RAG API...")
-    
+
     logger.info("Preloading models...")
     get_embeddings()
     _load_llama_guard()
@@ -47,19 +56,34 @@ async def lifespan(app: FastAPI):
         logger.info("Reranker model preloaded")
     else:
         logger.info("Reranker unavailable; skipping preload")
-    
-    # Preload any existing FAISS Indexes on disk
+
     from pathlib import Path
     base_path = Path(settings.faiss_index_path)
     if base_path.exists():
         for d in base_path.iterdir():
             if d.is_dir():
                 load_or_create_store(d.name)
+
     logger.info("RAG API ready!")
+
+    # Background session-cleanup loop: remove collections idle > 30 min
+    import asyncio
+
+    async def _session_cleanup_loop():
+        while True:
+            await asyncio.sleep(300)  # check every 5 minutes
+            removed = cleanup_stale_collections(ttl_seconds=1800)
+            if removed:
+                logger.info(f"Session cleanup removed {len(removed)} stale collection(s): {removed}")
+
+    cleanup_task = asyncio.create_task(_session_cleanup_loop())
+
     yield
+
+    cleanup_task.cancel()
     logger.info("Shutting down RAG API")
 
-# App
+
 app = FastAPI(
     title=settings.api_title,
     version=settings.api_version,
@@ -71,47 +95,46 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Request timing middleware
+
 @app.middleware("http")
-async def add_process_time_header(request,call_next):
+async def add_process_time_header(request, call_next):
     start = time.monotonic()
     response = await call_next(request)
-    duration_ms = round((time.monotonic()-start)*1000,2)
-    response.headers["X-Process-Time-Ms"] = str(duration_ms)
+    response.headers["X-Process-Time-Ms"] = str(round((time.monotonic() - start) * 1000, 2))
     return response
 
-# Helath
-@app.get("/health",response_model=HealthResponse,tags=["ops"])
+
+# ── Ops ──────────────────────────────────────────────────────────────────────
+
+@app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health():
     return HealthResponse(
         status="ok",
         vector_store_loaded=is_loaded(None),
         cache_connected=cache_connected(),
-        model=settings.chat_model
+        model=settings.chat_model,
     )
+
 
 @app.get("/cache_stats", tags=["ops"])
 async def cache_stats():
-    """Information about where the cache is stored and how many queries have been cached"""
     return get_cache_stats()
 
-# Ingest raw texts 
+
+# ── Ingest ────────────────────────────────────────────────────────────────────
+
 @app.post("/ingest", response_model=IngestResponse, tags=["ingest"])
 async def ingest_texts(req: IngestRequest):
-    """
-    Ingest raw text strings into a named collection.
-    - Chunks, embeds, and upserts into FAISS
-    - Persists index to disk
-    """
+    """Ingest raw text strings into a named collection."""
     try:
         docs = process_texts(
-            texts = req.texts,
+            texts=req.texts,
             metadatas=req.metadatas,
-            source_id=req.collection_name
+            source_id=req.collection_name,
         )
         add_documents(docs, collection=req.collection_name, force_reindex=req.force_reindex)
         return IngestResponse(
@@ -122,95 +145,214 @@ async def ingest_texts(req: IngestRequest):
         )
     except Exception as e:
         logger.exception("Ingest failed")
-        raise HTTPException(status_code=500,detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Ingest file upload
-@app.post("/ingest/file",response_model=IngestResponse,tags=["ingest"])
+
+@app.post("/ingest/file", response_model=IngestResponse, tags=["ingest"])
 async def ingest_file(
     file: UploadFile = File(...),
     collection_name: str = "default",
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
 ):
     """
-    Upload a PDF, TXT or markdown file, Processing runs in the background.
+    Upload a PDF, TXT, or Markdown file.
+    Returns a job_id immediately; processing runs in the background.
+    Poll GET /ingest/jobs/{job_id} or subscribe to GET /ingest/jobs/{job_id}/events.
     """
     import tempfile, os
 
-    suffix = "." + file.filename.rsplit(".",1)[-1].lower()
+    job_id = str(_uuid.uuid4())
+    suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
-    
+
+    _ingest_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "processing",
+        "collection_name": collection_name,
+        "filename": file.filename,
+        "chunks_created": 0,
+        "message": "File received, extracting text...",
+        "progress": 5,
+    }
+
     def _process():
         try:
+            _ingest_jobs[job_id]["progress"] = 20
+            _ingest_jobs[job_id]["message"] = "Extracting and chunking text..."
             docs = process_file(tmp_path)
-            add_documents(docs,collection=collection_name)
-            logger.info(f"Background ingest complete: {file.filename} -> {len(docs)} chunks")
+
+            _ingest_jobs[job_id]["progress"] = 60
+            _ingest_jobs[job_id]["message"] = f"Embedding and indexing {len(docs)} chunks..."
+            add_documents(docs, collection=collection_name)
+
+            _ingest_jobs[job_id]["progress"] = 100
+            _ingest_jobs[job_id]["status"] = "done"
+            _ingest_jobs[job_id]["chunks_created"] = len(docs)
+            _ingest_jobs[job_id]["message"] = f"Indexed {len(docs)} chunks into '{collection_name}'"
+            logger.info(f"Ingest job {job_id} complete: {file.filename} -> {len(docs)} chunks")
+        except Exception as e:
+            _ingest_jobs[job_id]["status"] = "failed"
+            _ingest_jobs[job_id]["message"] = str(e)
+            logger.exception(f"Ingest job {job_id} failed")
         finally:
             os.unlink(tmp_path)
-    
+
     if background_tasks:
         background_tasks.add_task(_process)
         return IngestResponse(
             success=True,
-            docs_indexed=-1, # unknown until background completes
+            docs_indexed=-1,
             collection_name=collection_name,
-            message=f"File '{file.filename}' queued for background processing",
+            message=f"Job '{job_id}' started for '{file.filename}'",
+            job_id=job_id,
         )
 
     _process()
     return IngestResponse(
-            success=True,
-            docs_indexed=0, # unknown until background completes
-            collection_name=collection_name,
-            message=f"File '{file.filename}' processed",
-        )
+        success=True,
+        docs_indexed=_ingest_jobs[job_id].get("chunks_created", 0),
+        collection_name=collection_name,
+        message=_ingest_jobs[job_id].get("message", "Done"),
+        job_id=job_id,
+    )
 
-# Query
-@app.post("/query", response_model=QueryResponse,tags=["query"])
+
+@app.get("/ingest/jobs", tags=["ingest"])
+async def list_ingest_jobs():
+    """List all ingestion jobs (most recent first)."""
+    return {"jobs": list(reversed(list(_ingest_jobs.values())))}
+
+
+@app.get("/ingest/jobs/{job_id}", tags=["ingest"])
+async def get_ingest_job(job_id: str):
+    """Get the current status of an ingestion job."""
+    job = _ingest_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return job
+
+
+@app.get("/ingest/jobs/{job_id}/events", tags=["ingest"])
+async def ingest_job_events(job_id: str):
+    """
+    SSE stream of ingestion progress events.
+    Emits the job dict every 300 ms until status is 'done' or 'failed'.
+    """
+    import asyncio, json
+
+    async def generate():
+        while True:
+            job = _ingest_jobs.get(job_id)
+            if not job:
+                yield f"data: {json.dumps({'error': 'Job not found'})}\n\n"
+                return
+            yield f"data: {json.dumps(job)}\n\n"
+            if job["status"] in ("done", "failed"):
+                return
+            await asyncio.sleep(0.3)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Query ─────────────────────────────────────────────────────────────────────
+
+@app.post("/query", response_model=QueryResponse, tags=["query"])
 async def query_endpoint(req: QueryRequest):
     """
     Main RAG query endpoint.
     Supports multi-turn history, hybrid retrieval, and semantic caching.
-    Set stream=true in body to get an SSE stream instead.
+    Set stream=true in body to get a plain SSE token stream.
     """
-    # first check if the collection loaded into the memory, else load it
     if not is_loaded(req.collection_name):
         load_or_create_store(req.collection_name)
-    # if it fails to load than , first we have to ingest it
     if not is_loaded(req.collection_name):
         raise HTTPException(
             status_code=404,
-            detail=f"Collection '{req.collection_name}' not found. Ingest docs first",
+            detail=f"Collection '{req.collection_name}' not found. Ingest docs first.",
         )
-    
+
     if req.stream:
         return StreamingResponse(
             stream_query(req),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering":"no"}
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    
+
     try:
         result = await run_query(req)
         return result
     except Exception as e:
-        logger.exception("Query Failed")
+        logger.exception("Query failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Evaluate
-@app.post("/evaluate",response_model=EvalResponse,tags=["eval"])
+
+@app.post("/query/pipeline", tags=["query"])
+async def pipeline_query_endpoint(req: QueryRequest):
+    """
+    Pipeline-events SSE endpoint.
+    Streams a structured JSON event for every RAG step (guardrail → cache →
+    rewrite → retrieval → context → generation), then streams LLM tokens.
+    Use this endpoint to power frontend animations of the RAG pipeline.
+    """
+    if not is_loaded(req.collection_name):
+        load_or_create_store(req.collection_name)
+    if not is_loaded(req.collection_name):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Collection '{req.collection_name}' not found. Ingest docs first.",
+        )
+    return StreamingResponse(
+        pipeline_stream_query(req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Collections ───────────────────────────────────────────────────────────────
+
+@app.get("/collections", tags=["collections"])
+async def list_collections_endpoint():
+    """List all collections with chunk count and disk size."""
+    names = list_collections()
+    return {"collections": [get_collection_stats(n) for n in names]}
+
+
+@app.get("/collections/{collection_name}", tags=["collections"])
+async def get_collection_endpoint(collection_name: str):
+    """Get detailed stats for a specific collection."""
+    if collection_name not in list_collections():
+        raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+    return get_collection_stats(collection_name)
+
+
+@app.delete("/collections/{collection_name}", tags=["collections"])
+async def delete_collection_endpoint(collection_name: str):
+    """Permanently delete a collection from memory and disk."""
+    deleted = delete_collection(collection_name)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+    return {"success": True, "message": f"Collection '{collection_name}' deleted"}
+
+
+# ── Evaluate ──────────────────────────────────────────────────────────────────
+
+@app.post("/evaluate", response_model=EvalResponse, tags=["eval"])
 async def evaluate_endpoint(req: EvalRequest):
-    """
-    Run RAGAS-style evaluation on a (question,answer,contexts) triple.
-    Use this in CI pipelines to gate quality regressions.
-    """
+    """Run RAGAS-style evaluation on a (question, answer, contexts) triple."""
     try:
         return await evaluate(req)
     except Exception as e:
         logger.exception("Eval failed")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # Entry point
 if __name__ == "__main__":
@@ -220,7 +362,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        workers=1
+        workers=1,
     )
 
 print("[api] FastAPI app configured.")

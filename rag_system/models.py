@@ -29,6 +29,7 @@ class IngestResponse(BaseModel):
     docs_indexed: int
     collection_name: str
     message: str
+    job_id: Optional[str] = None
 
 # Query
 
