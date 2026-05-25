@@ -42,11 +42,23 @@ def get_embeddings() -> HuggingFaceEmbeddings:
         BGE was finetuned with an instruction-like query prefix.
         We pass that prefix for query encoding only; documents remain unchanged.
     """
-    logger.info(f"Loading BGE model: {settings.embedding_model} on {settings.embedding_device}")
+    device = settings.embedding_device
+    if device and device != "cpu":
+        try:
+            import torch
+            if device == "cuda" and not torch.cuda.is_available():
+                logger.warning("CUDA requested but not available; falling back to CPU")
+                device = "cpu"
+        except Exception:
+            logger.warning("Torch unavailable or CUDA check failed; falling back to CPU")
+            device = "cpu"
+
+    device = device or "cpu"
+    logger.info(f"Loading BGE model: {settings.embedding_model} on {device}")
     model = HuggingFaceEmbeddings(
         model_name = settings.embedding_model,
         model_kwargs={
-            "device": settings.embedding_device,
+            "device": device,
         },
         encode_kwargs={
             "normalize_embeddings": settings.embedding_normalize,
