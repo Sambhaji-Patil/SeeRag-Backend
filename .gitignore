@@ -4,3 +4,4 @@ __pycache__
 faiss_indexes
 *.txt
 Test Docs
+!requirements.txt
