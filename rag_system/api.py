@@ -183,6 +183,10 @@ async def add_process_time_header(request, call_next):
 
 # ── Ops ──────────────────────────────────────────────────────────────────────
 
+@app.get("/", tags=["ops"])
+async def root():
+    return {"status": "ok", "service": settings.api_title}
+
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health():
     return HealthResponse(
