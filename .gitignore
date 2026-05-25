@@ -5,3 +5,5 @@ faiss_indexes
 *.txt
 Test Docs
 !requirements.txt
+frontend
+.claude

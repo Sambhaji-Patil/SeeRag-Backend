@@ -223,4 +223,80 @@ async def retrieve(
     
     return results
 
+import re as _re
+
+_COMPARISON_RE = _re.compile(
+    r"\b(compare|comparison|contrast|difference|differ|both|versus|\bvs\b|between|across|"
+    r"each\s+(document|doc|file)|all\s+(documents?|docs?|files?)|"
+    r"what\s+do\s+(both|all)|how\s+do\s+.{0,20}(differ|compare))\b",
+    _re.IGNORECASE,
+)
+
+
+def detect_query_scope(query: str, collections: list[str]) -> list[str]:
+    """
+    Returns which sub-collections to search for this query.
+    Tier 1 — comparison keywords → all collections.
+    Tier 2 — explicit doc name in query → matched collection(s).
+    Default → all collections (safest fallback).
+    """
+    if len(collections) <= 1:
+        return collections
+
+    if _COMPARISON_RE.search(query):
+        return collections
+
+    query_lower = query.lower()
+    matched = [
+        c for c in collections
+        if c.split("__")[-1].replace("_", " ").replace("-", " ").lower() in query_lower
+    ]
+    return matched if matched else collections
+
+
+async def multi_collection_retrieve(
+    query: str,
+    collections: list[str],
+    mode: str = "hybrid",
+    k_per_collection: int = 5,
+    use_reranker: bool = True,
+    expand_context: bool = True,
+) -> list[tuple[Document, float]]:
+    """
+    Retrieves from each collection independently, guaranteeing each document gets
+    at least k_per_collection candidates before the pool is reranked.
+    """
+    pool: list[tuple[Document, float]] = []
+
+    for coll in collections:
+        try:
+            results = await retrieve(
+                query=query,
+                collection=coll,
+                mode=mode,
+                top_k=k_per_collection,
+                use_reranker=False,   # defer reranking until after merge
+                expand_context=expand_context,
+            )
+            pool.extend(results)
+        except Exception as e:
+            logger.warning(f"Retrieval skipped for '{coll}': {e}")
+
+    if not pool:
+        return []
+
+    # Deduplicate by doc_id
+    seen: set[str] = set()
+    deduped: list[tuple[Document, float]] = []
+    for doc, score in pool:
+        did = str(doc.metadata.get("doc_id", id(doc)))
+        if did not in seen:
+            seen.add(did)
+            deduped.append((doc, score))
+
+    k_final = k_per_collection * len(collections)
+    if use_reranker and _reranker.available:
+        return _reranker.rerank(query, deduped, top_k=k_final)
+    return deduped[:k_final]
+
 print("[retriever] Module ready")

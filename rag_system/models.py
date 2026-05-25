@@ -43,6 +43,7 @@ class QueryRequest(BaseModel):
     collection_name: str = Field(default="default")
     retrieval_mode: RetrievalMode = RetrievalMode.HYBRID
     top_k: Optional[int] = None
+    doc_collections: Optional[list[str]] = None  # per-doc sub-collections; None = legacy single-collection mode
     history: list[ChatMessage] = Field(default_factory=list)
     stream: bool = False
 

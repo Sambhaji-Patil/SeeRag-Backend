@@ -44,6 +44,16 @@ settings = get_settings()
 _ingest_jobs: dict[str, dict] = {}
 
 
+def _safe_coll_name(filename: str) -> str:
+    """Convert a filename to a safe FAISS collection name component."""
+    from pathlib import Path as _Path
+    import re as _re
+    stem = _Path(filename).stem if filename else "doc"
+    safe = _re.sub(r'[^a-z0-9-]', '_', stem.lower())
+    safe = _re.sub(r'_+', '_', safe).strip('_')[:40]
+    return safe or 'doc'
+
+
 # Lifespan (startup / shutdown)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -163,6 +173,7 @@ async def ingest_file(
 
     job_id = str(_uuid.uuid4())
     suffix = "." + file.filename.rsplit(".", 1)[-1].lower()
+    doc_collection = f"{collection_name}__{_safe_coll_name(file.filename)}"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
@@ -172,7 +183,7 @@ async def ingest_file(
     _ingest_jobs[job_id] = {
         "job_id": job_id,
         "status": "processing",
-        "collection_name": collection_name,
+        "collection_name": doc_collection,
         "filename": file.filename,
         "chunks_created": 0,
         "message": "File received, extracting text...",
@@ -183,16 +194,16 @@ async def ingest_file(
         try:
             _ingest_jobs[job_id]["progress"] = 20
             _ingest_jobs[job_id]["message"] = "Extracting and chunking text..."
-            docs = process_file(tmp_path)
+            docs = process_file(tmp_path, display_name=file.filename)
 
             _ingest_jobs[job_id]["progress"] = 60
             _ingest_jobs[job_id]["message"] = f"Embedding and indexing {len(docs)} chunks..."
-            add_documents(docs, collection=collection_name)
+            add_documents(docs, collection=doc_collection)
 
             _ingest_jobs[job_id]["progress"] = 100
             _ingest_jobs[job_id]["status"] = "done"
             _ingest_jobs[job_id]["chunks_created"] = len(docs)
-            _ingest_jobs[job_id]["message"] = f"Indexed {len(docs)} chunks into '{collection_name}'"
+            _ingest_jobs[job_id]["message"] = f"Indexed {len(docs)} chunks into '{doc_collection}'"
             logger.info(f"Ingest job {job_id} complete: {file.filename} -> {len(docs)} chunks")
         except Exception as e:
             _ingest_jobs[job_id]["status"] = "failed"
@@ -206,7 +217,7 @@ async def ingest_file(
         return IngestResponse(
             success=True,
             docs_indexed=-1,
-            collection_name=collection_name,
+            collection_name=doc_collection,
             message=f"Job '{job_id}' started for '{file.filename}'",
             job_id=job_id,
         )
@@ -215,7 +226,7 @@ async def ingest_file(
     return IngestResponse(
         success=True,
         docs_indexed=_ingest_jobs[job_id].get("chunks_created", 0),
-        collection_name=collection_name,
+        collection_name=doc_collection,
         message=_ingest_jobs[job_id].get("message", "Done"),
         job_id=job_id,
     )
@@ -268,15 +279,17 @@ async def ingest_job_events(job_id: str):
 async def query_endpoint(req: QueryRequest):
     """
     Main RAG query endpoint.
-    Supports multi-turn history, hybrid retrieval, and semantic caching.
+    Supports multi-turn history, hybrid retrieval, semantic caching, and multi-doc routing.
     Set stream=true in body to get a plain SSE token stream.
     """
-    if not is_loaded(req.collection_name):
-        load_or_create_store(req.collection_name)
-    if not is_loaded(req.collection_name):
+    collections = req.doc_collections or [req.collection_name]
+    for coll in collections:
+        if not is_loaded(coll):
+            load_or_create_store(coll)
+    if not any(is_loaded(c) for c in collections):
         raise HTTPException(
             status_code=404,
-            detail=f"Collection '{req.collection_name}' not found. Ingest docs first.",
+            detail="No indexed documents found. Ingest documents first.",
         )
 
     if req.stream:
@@ -297,17 +310,18 @@ async def query_endpoint(req: QueryRequest):
 @app.post("/query/pipeline", tags=["query"])
 async def pipeline_query_endpoint(req: QueryRequest):
     """
-    Pipeline-events SSE endpoint.
+    Pipeline-events SSE endpoint — supports multi-doc routing.
     Streams a structured JSON event for every RAG step (guardrail → cache →
-    rewrite → retrieval → context → generation), then streams LLM tokens.
-    Use this endpoint to power frontend animations of the RAG pipeline.
+    rewrite → doc_routing → retrieval → context → generation), then streams LLM tokens.
     """
-    if not is_loaded(req.collection_name):
-        load_or_create_store(req.collection_name)
-    if not is_loaded(req.collection_name):
+    collections = req.doc_collections or [req.collection_name]
+    for coll in collections:
+        if not is_loaded(coll):
+            load_or_create_store(coll)
+    if not any(is_loaded(c) for c in collections):
         raise HTTPException(
             status_code=404,
-            detail=f"Collection '{req.collection_name}' not found. Ingest docs first.",
+            detail="No indexed documents found. Ingest documents first.",
         )
     return StreamingResponse(
         pipeline_stream_query(req),

@@ -181,4 +181,18 @@ def delete_collection(collection: str) -> bool:
     return False
 
 
+def get_session_collections(session_id: str) -> list[str]:
+    """Return all per-doc sub-collections for this session (format: {session_id}__{docname})."""
+    prefix = f"{session_id}__"
+    found: set[str] = set()
+    for name, store in _stores.items():
+        if name.startswith(prefix) and store is not None:
+            found.add(name)
+    base = Path(settings.faiss_index_path)
+    if base.exists():
+        for d in base.iterdir():
+            if d.is_dir() and d.name.startswith(prefix):
+                found.add(d.name)
+    return sorted(found)
+
 print("[vector_store] Module ready.")

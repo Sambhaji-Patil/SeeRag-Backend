@@ -123,11 +123,12 @@ def process_texts(
     logger.info(f"Processed {len(texts)} texts -> {len(chunks)} chunks")
     return chunks
 
-def process_file(file_path: str) -> list[Document]:
-    """End to end ingestion of file path"""
+def process_file(file_path: str, display_name: str | None = None) -> list[Document]:
+    """End to end ingestion of file path. display_name overrides the temp path as source_id."""
     docs = load_file(file_path)
     texts = [d.page_content for d in docs]
     metas = [d.metadata for d in docs]
-    return process_texts(texts,metas,source_id=file_path)
+    source = display_name if display_name else file_path
+    return process_texts(texts, metas, source_id=source)
 
 print("[document_processor] Module ready")
