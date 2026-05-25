@@ -37,7 +37,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
           HF_SPACE_PATH: "rag_system"
-          HF_PATH_IN_REPO: "."
+          HF_PATH_IN_REPO: "rag_system"
         run: |
           python - <<'PY'
           import os
