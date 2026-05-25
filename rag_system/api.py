@@ -4,7 +4,7 @@ import uuid as _uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
@@ -42,6 +42,67 @@ settings = get_settings()
 
 # In-memory job registry for background ingestion tasks
 _ingest_jobs: dict[str, dict] = {}
+
+# Raw file bytes for document preview: collection_name -> (bytes, content_type)
+_doc_files: dict[str, tuple[bytes, str]] = {}
+
+_FILE_CONTENT_TYPES: dict[str, str] = {
+    '.pdf': 'application/pdf',
+    '.txt': 'text/plain; charset=utf-8',
+    '.md':  'text/markdown; charset=utf-8',
+}
+
+# Viz cache: per collection, stores fitted PCA + 2D projected points
+_viz_cache: dict[str, dict] = {}
+
+
+def _compute_viz(collection: str) -> dict:
+    """PCA-project all chunk embeddings to 2D. Cached per collection."""
+    if collection in _viz_cache:
+        return _viz_cache[collection]
+
+    from .vector_store import get_store
+    store = get_store(collection)
+    if store is None or store.index.ntotal == 0:
+        return {"points": [], "pca": None, "vectors": None}
+
+    import numpy as np
+    from sklearn.decomposition import PCA
+
+    n = store.index.ntotal
+    d = store.index.d
+    try:
+        vectors = store.index.reconstruct_n(0, n).astype(np.float32)
+    except Exception:
+        return {"points": [], "pca": None, "vectors": None}
+
+    n_components = min(2, n, d)
+    pca = PCA(n_components=n_components)
+    coords = pca.fit_transform(vectors)
+
+    points = []
+    for i in range(n):
+        doc_id = store.index_to_docstore_id.get(i)
+        if not doc_id:
+            continue
+        doc = store.docstore._dict.get(doc_id)
+        if not doc:
+            continue
+        cx = float(coords[i, 0]) if n_components >= 1 else 0.0
+        cy = float(coords[i, 1]) if n_components >= 2 else 0.0
+        points.append({
+            "doc_id": doc_id,
+            "x": cx,
+            "y": cy,
+            "preview": doc.page_content[:100],
+            "page": doc.metadata.get("page"),
+            "source": str(doc.metadata.get("source_id", "")),
+            "chunk_index": int(doc.metadata.get("chunk_index", i)),
+        })
+
+    result = {"points": points, "pca": pca, "vectors": vectors}
+    _viz_cache[collection] = result
+    return result
 
 
 def _safe_coll_name(filename: str) -> str:
@@ -85,6 +146,8 @@ async def lifespan(app: FastAPI):
             removed = cleanup_stale_collections(ttl_seconds=1800)
             if removed:
                 logger.info(f"Session cleanup removed {len(removed)} stale collection(s): {removed}")
+                for coll in removed:
+                    _doc_files.pop(coll, None)
 
     cleanup_task = asyncio.create_task(_session_cleanup_loop())
 
@@ -180,6 +243,8 @@ async def ingest_file(
         tmp.write(content)
         tmp_path = tmp.name
 
+    _doc_files[doc_collection] = (content, _FILE_CONTENT_TYPES.get(suffix, 'application/octet-stream'))
+
     _ingest_jobs[job_id] = {
         "job_id": job_id,
         "status": "processing",
@@ -199,6 +264,7 @@ async def ingest_file(
             _ingest_jobs[job_id]["progress"] = 60
             _ingest_jobs[job_id]["message"] = f"Embedding and indexing {len(docs)} chunks..."
             add_documents(docs, collection=doc_collection)
+            _viz_cache.pop(doc_collection, None)  # invalidate stale viz
 
             _ingest_jobs[job_id]["progress"] = 100
             _ingest_jobs[job_id]["status"] = "done"
@@ -353,7 +419,83 @@ async def delete_collection_endpoint(collection_name: str):
     deleted = delete_collection(collection_name)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+    _doc_files.pop(collection_name, None)
+    _viz_cache.pop(collection_name, None)
     return {"success": True, "message": f"Collection '{collection_name}' deleted"}
+
+
+# ── Viz ───────────────────────────────────────────────────────────────────────
+
+@app.get("/collections/{collection_name}/viz", tags=["viz"])
+async def get_collection_viz(collection_name: str):
+    """Return PCA 2D projection of all chunk embeddings for scatter-plot visualization."""
+    if not is_loaded(collection_name):
+        load_or_create_store(collection_name)
+    if not is_loaded(collection_name):
+        raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+    result = _compute_viz(collection_name)
+    return {"collection": collection_name, "points": result["points"]}
+
+
+@app.post("/collections/{collection_name}/query_similarity", tags=["viz"])
+async def get_query_similarity(collection_name: str, body: dict = Body(...)):
+    """
+    Project a query into the chunk embedding PCA space.
+    Returns query 2D position + all chunks with cosine similarity scores.
+    Enables the live similarity animation as the user types.
+    """
+    query = (body.get("query") or "").strip()
+    if not query:
+        return {"query": None, "chunks": []}
+
+    if not is_loaded(collection_name):
+        load_or_create_store(collection_name)
+    if not is_loaded(collection_name):
+        raise HTTPException(status_code=404, detail=f"Collection '{collection_name}' not found")
+
+    result = _compute_viz(collection_name)
+    if not result["points"] or result["pca"] is None:
+        return {"query": None, "chunks": []}
+
+    import numpy as np
+
+    q_vec = np.array(get_embeddings().embed_query(query), dtype=np.float32).reshape(1, -1)
+    q_2d = result["pca"].transform(q_vec)[0]
+
+    vectors = result["vectors"]
+    norms = np.linalg.norm(vectors, axis=1)
+    q_norm = float(np.linalg.norm(q_vec))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sims = (vectors @ q_vec.T).flatten() / (norms * q_norm + 1e-10)
+
+    chunks = []
+    for i, pt in enumerate(result["points"]):
+        chunks.append({**pt, "score": float(sims[i]) if i < len(sims) else 0.0})
+    chunks.sort(key=lambda c: c["score"], reverse=True)
+
+    return {
+        "query": {"x": float(q_2d[0]), "y": float(q_2d[1])},
+        "chunks": chunks,
+    }
+
+
+# ── Documents ─────────────────────────────────────────────────────────────────
+
+@app.get("/documents/{collection_name}/raw", tags=["documents"])
+async def get_document_raw(collection_name: str):
+    """Serve raw document bytes for in-browser preview."""
+    from fastapi.responses import Response
+    entry = _doc_files.get(collection_name)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Document '{collection_name}' not available for preview")
+    data, media_type = entry
+    # Derive a human-readable filename from the collection key
+    display_name = collection_name.split("__")[-1] if "__" in collection_name else collection_name
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+    )
 
 
 # ── Evaluate ──────────────────────────────────────────────────────────────────
