@@ -1,0 +1,7 @@
+{
+  "mode": "openai-small",
+  "provider": "openai",
+  "model_name": "text-embedding-3-small",
+  "dimensions": 1536,
+  "device": "api"
+}

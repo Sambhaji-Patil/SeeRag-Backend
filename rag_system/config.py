@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 32
     embedding_normalize: bool = True
 
+    # Try Docs (pre-indexed demo docs)
+    try_docs_path: str = os.path.join(os.path.dirname(__file__), "Try Docs")
+    try_docs_prefix: str = "try__"
+
     #FAISS
     faiss_index_path: str = "./faiss_indexes"
     faiss_index_name: str = "prod_rag"

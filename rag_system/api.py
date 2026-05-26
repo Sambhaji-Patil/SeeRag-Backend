@@ -21,6 +21,7 @@ from .vector_store import (
     add_documents, load_or_create_store, is_loaded,
     list_collections, get_collection_stats, delete_collection,
     cleanup_stale_collections, get_collection_embedding_mode,
+    pin_collection,
 )
 from .query_engine import query as run_query, stream_query, pipeline_stream_query
 from .eval import evaluate
@@ -45,6 +46,9 @@ _ingest_jobs: dict[str, dict] = {}
 
 # Raw file bytes for document preview: collection_name -> (bytes, content_type)
 _doc_files: dict[str, tuple[bytes, str]] = {}
+
+# Try Docs file paths: collection_name -> path
+_try_doc_paths: dict[str, "Path"] = {}
 
 _FILE_CONTENT_TYPES: dict[str, str] = {
     '.pdf': 'application/pdf',
@@ -115,6 +119,41 @@ def _safe_coll_name(filename: str) -> str:
     return safe or 'doc'
 
 
+def _try_doc_collection_name(filename: str) -> str:
+    return f"{settings.try_docs_prefix}{_safe_coll_name(filename)}"
+
+
+def _load_try_docs() -> None:
+    """Load pre-indexed Try Docs into memory and cache raw bytes for preview."""
+    from pathlib import Path
+
+    try_dir = Path(settings.try_docs_path)
+    if not try_dir.exists():
+        logger.info("Try Docs folder not found at %s", try_dir)
+        return
+
+    for path in sorted(try_dir.iterdir()):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in _FILE_CONTENT_TYPES:
+            continue
+
+        collection = _try_doc_collection_name(path.name)
+        _try_doc_paths[collection] = path
+
+        store = load_or_create_store(collection)
+        if store is not None:
+            pin_collection(collection)
+        else:
+            logger.warning("Try Doc index missing for '%s' (%s)", path.name, collection)
+
+        try:
+            _doc_files[collection] = (path.read_bytes(), _FILE_CONTENT_TYPES[suffix])
+        except Exception:
+            logger.warning("Failed to cache Try Doc file bytes for '%s'", path.name)
+
+
 # Lifespan (startup / shutdown)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -134,6 +173,8 @@ async def lifespan(app: FastAPI):
         for d in base_path.iterdir():
             if d.is_dir():
                 load_or_create_store(d.name)
+
+    _load_try_docs()
 
     logger.info("RAG API ready!")
 
@@ -205,6 +246,43 @@ async def cache_stats():
 @app.get("/embeddings/info", tags=["ops"])
 async def embeddings_info():
     return get_embeddings_runtime_info()
+
+
+# ── Try Docs ─────────────────────────────────────────────────────────────────
+
+@app.get("/try_docs", tags=["try_docs"])
+async def list_try_docs():
+    """List pre-indexed Try Docs available to add to a session."""
+    from pathlib import Path
+
+    try_dir = Path(settings.try_docs_path)
+    if not try_dir.exists():
+        return {"docs": []}
+
+    docs = []
+    for path in sorted(try_dir.iterdir()):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in _FILE_CONTENT_TYPES:
+            continue
+
+        collection = _try_doc_collection_name(path.name)
+        _try_doc_paths.setdefault(collection, path)
+
+        index_path = Path(settings.faiss_index_path) / collection
+        stats = get_collection_stats(collection) if index_path.exists() else None
+
+        docs.append({
+            "filename": path.name,
+            "collection": collection,
+            "chunks": stats["chunk_count"] if stats else 0,
+            "embedding_mode": stats["embedding_mode"] if stats else None,
+            "size_mb": stats["size_mb"] if stats else 0.0,
+            "ready": stats is not None,
+        })
+
+    return {"docs": docs}
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -503,6 +581,14 @@ async def get_document_raw(collection_name: str):
     """Serve raw document bytes for in-browser preview."""
     from fastapi.responses import Response
     entry = _doc_files.get(collection_name)
+    if not entry and collection_name in _try_doc_paths:
+        path = _try_doc_paths[collection_name]
+        try:
+            suffix = path.suffix.lower()
+            _doc_files[collection_name] = (path.read_bytes(), _FILE_CONTENT_TYPES.get(suffix, 'application/octet-stream'))
+            entry = _doc_files.get(collection_name)
+        except Exception:
+            entry = None
     if not entry:
         raise HTTPException(status_code=404, detail=f"Document '{collection_name}' not available for preview")
     data, media_type = entry

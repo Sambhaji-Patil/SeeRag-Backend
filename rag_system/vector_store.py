@@ -26,6 +26,7 @@ _stores: dict[str, FAISS] = {}
 # Tracks last-used timestamp per collection (epoch seconds) for TTL-based cleanup
 _last_used: dict[str, float] = {}
 _collection_embeddings: dict[str, str] = {}
+_pinned: set[str] = set()
 
 _EMBEDDING_META_FILE = "embedding.json"
 
@@ -62,6 +63,14 @@ def get_collection_embedding_mode(collection: str) -> Optional[str]:
             _collection_embeddings[collection] = mode
             return mode
     return None
+
+
+def pin_collection(collection: str) -> None:
+    _pinned.add(collection)
+
+
+def is_pinned_collection(collection: str) -> bool:
+    return collection in _pinned
 
 
 def resolve_embedding_mode_for_collections(
@@ -274,7 +283,10 @@ def cleanup_stale_collections(ttl_seconds: int = 1800) -> list[str]:
     Returns the list of collection names that were removed.
     """
     cutoff = time.time() - ttl_seconds
-    stale = [name for name, ts in list(_last_used.items()) if ts < cutoff]
+    stale = [
+        name for name, ts in list(_last_used.items())
+        if ts < cutoff and name not in _pinned
+    ]
     for name in stale:
         logger.info(f"Cleaning up stale collection '{name}' (idle > {ttl_seconds}s)")
         delete_collection(name)
@@ -290,6 +302,8 @@ def delete_collection(collection: str) -> bool:
         del _stores[collection]
     if collection in _collection_embeddings:
         del _collection_embeddings[collection]
+    if collection in _pinned:
+        _pinned.discard(collection)
 
     # Local import to avoid circular dependency with retriever
     from .retriever import _bm25_cache
