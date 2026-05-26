@@ -152,8 +152,8 @@ def get_semantic(query_vec: list[float], collection_key: str, params_key: str) -
     k = 4
     params_tag = _tag_hash(params_key)
     query = (
-        f"@{COLLECTION_FIELD}:{{{collection_key}}} "
-        f"@{PARAMS_FIELD}:{{{params_tag}}} "
+        f"(@{COLLECTION_FIELD}:{{{collection_key}}} "
+        f"@{PARAMS_FIELD}:{{{params_tag}}})"
         f"=>[KNN {k} @{VECTOR_FIELD} $vec AS score]"
     )
 

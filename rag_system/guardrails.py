@@ -265,12 +265,7 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
         return GuardrailResult(allowed=True, sanitized_text=query)
 
     try:
-        conversation = [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": query}],
-            }
-        ]
+        conversation = [{"role": "user", "content": query}]
 
         input_ids = _llama_guard_tokenizer.apply_chat_template(
             conversation,
@@ -331,7 +326,7 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
         logger.info("Llama Guard passed query | verdict='%s'", verdict)
         return GuardrailResult(allowed=True, sanitized_text=query)
     except Exception as exc:
-        logger.warning("Llama Guard runtime check failed; falling back to regex checks: %s", exc)
+        logger.warning("Llama Guard runtime check failed; falling back to regex checks: %r", exc)
         return GuardrailResult(allowed=True, sanitized_text=query)
 
 def check_query(query: str) -> GuardrailResult:
