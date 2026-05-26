@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "rag_system/**"
+      - "faiss_indexes/**"
       - "requirements.txt"
       - "Dockerfile"
       - "README.md"
@@ -38,6 +39,7 @@ jobs:
           HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
           HF_SPACE_PATH: "rag_system"
           HF_PATH_IN_REPO: "rag_system"
+          HF_FAISS_PATH: "faiss_indexes"
         run: |
           python - <<'PY'
           import os
@@ -47,6 +49,7 @@ jobs:
           repo_id = os.environ["HF_SPACE_ID"]
           folder_path = os.environ.get("HF_SPACE_PATH", "rag_system")
           path_in_repo = os.environ.get("HF_PATH_IN_REPO", ".")
+          faiss_path = os.environ.get("HF_FAISS_PATH", "faiss_indexes")
 
           if not os.path.isdir(folder_path):
               raise SystemExit(f"Folder not found: {folder_path}")
@@ -63,6 +66,20 @@ jobs:
                   "**/.DS_Store",
               ],
           )
+
+            if os.path.isdir(faiss_path):
+              upload_folder(
+                repo_id=repo_id,
+                folder_path=faiss_path,
+                path_in_repo=faiss_path,
+                repo_type="space",
+                token=token,
+                ignore_patterns=[
+                  "**/.DS_Store",
+                ],
+              )
+            else:
+              print(f"FAISS folder not found: {faiss_path}")
 
           for extra in ("requirements.txt", "Dockerfile", "README.md"):
               if os.path.isfile(extra):
