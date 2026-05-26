@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM redis/redis-stack-server:latest
 
 # HuggingFace Spaces runs as a non-root user; port 7860 is the default
 ENV PORT=7860
@@ -7,32 +7,27 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-# System deps for PyPDF + Redis Stack
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libgomp1 \
-    ca-certificates \
-    curl \
-    gnupg \
-    && rm -rf /var/lib/apt/lists/*
+USER root
 
-# Redis Stack (for vector search)
-# Note: Redis Stack packages live under the redis-stack apt repo.
-RUN set -eux; \
-    curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg; \
-    echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/redis-stack/deb bookworm main" \
-      > /etc/apt/sources.list.d/redis-stack.list; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends redis-stack-server; \
-    rm -rf /var/lib/apt/lists/*
+# System deps for PyPDF + Python runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  python3 \
+  python3-pip \
+  python3-venv \
+  build-essential \
+  libgomp1 \
+  ca-certificates \
+  curl \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
 # FAISS index dir (ephemeral per session — wiped on container restart)
-RUN mkdir -p /app/faiss_indexes /app/context
+RUN mkdir -p /app/faiss_indexes /app/context \
+  && chmod -R 777 /app/faiss_indexes /app/context
 
 ENV REDIS_URL=redis://localhost:6379
 ENV CACHE_ENABLED=true
