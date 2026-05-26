@@ -17,9 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Redis Stack (for vector search)
+# Note: Redis Stack packages may lag on Debian trixie; use bookworm repo for compatibility.
 RUN set -eux; \
     curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg; \
-    echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+    echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb bookworm main" \
       > /etc/apt/sources.list.d/redis.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends redis-stack-server; \
