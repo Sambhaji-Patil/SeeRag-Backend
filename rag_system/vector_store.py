@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import os
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -225,7 +226,13 @@ def similarity_search_with_scores(
     if store is None:
         raise ValueError(f"Collection '{collection}' not loaded. Ingest documents first.")
     _last_used[collection] = time.time()
-    return store.similarity_search_with_relevance_scores(query, k=k)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Relevance scores must be between 0 and 1, got.*",
+            category=UserWarning,
+        )
+        return store.similarity_search_with_relevance_scores(query, k=k)
 
 def get_store(collection: str = "default") -> Optional[FAISS]:
     return _stores.get(collection)

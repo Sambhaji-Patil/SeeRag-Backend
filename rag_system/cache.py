@@ -1,133 +1,274 @@
 """
-Two-layer cache:
-1. Exact-match hash cache (Redis/in-memory fallback)
-2. Semantic near-duplicate cache using cosine similarity on query embeddings
-
-Semantic caching prevents re-querying the LLM for paraphrased versions of the 
-same question - a major cost & latency win in production
+Try Docs cache (Redis-only):
+1. Exact-match cache in Redis
+2. Semantic cache using Redis Vector Search (RediSearch)
 """
+from __future__ import annotations
 
 import hashlib
-import json 
+import json
 import logging
-import time
+import uuid
 from typing import Optional
 
-from google_crc32c import value
 import numpy as np
 
 from .config import get_settings
-from .embeddings import cosine_similarity
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# In memory fallback (used when Redis is unavailable)
+CACHE_EMBEDDING_MODE = "openai-small"
+EXACT_PREFIX = "rag:try:exact:"
+SEMANTIC_INDEX = "rag:try:semantic"
+SEMANTIC_PREFIX = "rag:try:sem:"
+VECTOR_FIELD = "vector"
+PAYLOAD_FIELD = "payload"
+COLLECTION_FIELD = "collection_key"
+PARAMS_FIELD = "params_key"
 
-class InMemoryCache:
-    def __init__(self,ttl: int = 3600, max_size: int = 1000):
-        self._store: dict[str,tuple[str, float]] = {} # Key -> (value, expiry)
-        self.ttl = ttl
-        self.max_size = max_size
-    
-    def get(self,key: str) -> Optional[str]:
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        value, expiry = entry
-        if time.time() > expiry:
-            del self._store[key]
-            return None
-        return value
-    
-    def set(self,key: str, value: str) -> None:
-        if len(self._store) >= self.max_size:
-            oldest = next(iter(self._store))
-            del self._store[oldest]
-        self._store[key] = (value, time.time() + self.ttl)
-    
-    def ping(self) -> bool:
-        return True
-    
+
 def _build_redis_client():
     try:
         import redis
-        client = redis.from_url(settings.redis_url, decode_responses=True)
+
+        client = redis.from_url(settings.redis_url, decode_responses=False)
         client.ping()
         logger.info("Redis cache connected")
         return client
-    except Exception as e:
-        logger.warning(f"Redis unavalaible ({e}) - using in-memory cache.")
-        return InMemoryCache(ttl=settings.cache_ttl_seconds)
+    except Exception as exc:
+        logger.warning("Redis unavailable (%s); caching disabled", exc)
+        return None
 
-_cache_client = _build_redis_client()
 
-# Exact match cache
-def _cache_key(query: str, collection: str, mode: str, embedding_mode: str) -> str:
-    payload = f"{query}::{collection}::{mode}::{embedding_mode}"
-    return "rag:exact:" + hashlib.sha256(payload.encode()).hexdigest()[:32]
+_client = _build_redis_client()
+_semantic_ready = False
+_semantic_failed = False
 
-def get_exact(query: str, collection: str, mode: str, embedding_mode: str) -> Optional[dict]:
-    key = _cache_key(query, collection, mode, embedding_mode)
-    raw = _cache_client.get(key)
-    if raw:
-        logger.debug(f"Exact cache hit: {key[:16]}...")
-        return json.loads(raw)
-    return None
 
-def set_exact(query: str, collection: str, mode: str, embedding_mode: str, value: str) -> None:
-    key = _cache_key(query, collection, mode, embedding_mode)
+def _ensure_semantic_index() -> bool:
+    global _semantic_ready, _semantic_failed
+    if _semantic_ready:
+        return True
+    if _semantic_failed or _client is None:
+        return False
+
+    try:
+        _client.execute_command("FT.INFO", SEMANTIC_INDEX)
+        _semantic_ready = True
+        return True
+    except Exception:
+        pass
+
+    try:
+        dim = str(int(settings.embedding_dimensions_openai))
+        _client.execute_command(
+            "FT.CREATE",
+            SEMANTIC_INDEX,
+            "ON",
+            "HASH",
+            "PREFIX",
+            1,
+            SEMANTIC_PREFIX,
+            "SCHEMA",
+            "query",
+            "TEXT",
+            COLLECTION_FIELD,
+            "TAG",
+            PARAMS_FIELD,
+            "TAG",
+            VECTOR_FIELD,
+            "VECTOR",
+            "HNSW",
+            6,
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            dim,
+            "DISTANCE_METRIC",
+            "COSINE",
+        )
+        _semantic_ready = True
+        return True
+    except Exception as exc:
+        logger.warning("Failed to create Redis vector index: %s", exc)
+        _semantic_failed = True
+        return False
+
+
+def _exact_key(query: str, collection_key: str, params_key: str) -> str:
+    payload = f"{query}::{collection_key}::{params_key}"
+    return EXACT_PREFIX + hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def _vector_bytes(vec: list[float]) -> bytes:
+    return np.array(vec, dtype=np.float32).tobytes()
+
+
+def _decode(value: bytes | str | None) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+# Exact cache
+
+def get_exact(query: str, collection_key: str, params_key: str) -> Optional[dict]:
+    if _client is None:
+        return None
+    key = _exact_key(query, collection_key, params_key)
+    raw = _client.get(key)
+    if not raw:
+        return None
+    payload = _decode(raw)
+    if payload is None:
+        return None
+    return json.loads(payload)
+
+
+def set_exact(query: str, collection_key: str, params_key: str, value: dict) -> None:
+    if _client is None:
+        return
+    key = _exact_key(query, collection_key, params_key)
     serialized = json.dumps(value)
-    if hasattr(_cache_client,"setex"):
-        _cache_client.setex(key,settings.cache_ttl_seconds,serialized)
-    else:
-        _cache_client.set(key,serialized)
+    _client.set(key, serialized.encode("utf-8"), ex=settings.cache_ttl_seconds)
 
-# Semantic Cache
-# stores (embedding, serialized_response) pairs keyed by short hash
-_semantic_index: dict[str, list[tuple[list[float],str,dict]]] = {} # mode -> (vec,key,response)
 
-def get_semantic(query_vec: list[float], embedding_mode: str) -> Optional[dict]:
-    """Return the cache response if cosine similarity > threshold"""
-    pool = _semantic_index.get(embedding_mode, [])
-    best_score = 0.0
-    best_response = None
-    for vec, _,response in pool:
-        score = cosine_similarity(query_vec,vec)
-        if score > best_score:
-            best_score = score
-            best_response = response
-    if best_score >= settings.semantic_cache_threshold:
-        logger.info(f"Semantic Cache hit (score={best_score:.3f})")
-        return best_response
+# Semantic cache
+
+def get_semantic(query_vec: list[float], collection_key: str, params_key: str) -> Optional[dict]:
+    if _client is None:
+        return None
+    if not _ensure_semantic_index():
+        return None
+
+    vec = _vector_bytes(query_vec)
+    k = 4
+    query = (
+        f"@{COLLECTION_FIELD}:{{{collection_key}}} "
+        f"@{PARAMS_FIELD}:{{{params_key}}}"
+        f"=>[KNN {k} @{VECTOR_FIELD} $vec AS score]"
+    )
+
+    try:
+        res = _client.execute_command(
+            "FT.SEARCH",
+            SEMANTIC_INDEX,
+            query,
+            "PARAMS",
+            2,
+            "vec",
+            vec,
+            "RETURN",
+            2,
+            PAYLOAD_FIELD,
+            "score",
+            "DIALECT",
+            2,
+        )
+    except Exception as exc:
+        logger.warning("Redis semantic search failed: %s", exc)
+        return None
+
+    if not res or res[0] == 0:
+        return None
+
+    best_similarity = 0.0
+    best_payload = None
+
+    for i in range(1, len(res), 2):
+        fields = res[i + 1]
+        payload = None
+        distance = None
+        for j in range(0, len(fields), 2):
+            name = _decode(fields[j]) or ""
+            value = fields[j + 1]
+            if name == PAYLOAD_FIELD:
+                payload = _decode(value)
+            elif name == "score":
+                distance = float(_decode(value) or 0)
+        if payload is None or distance is None:
+            continue
+        similarity = 1.0 - distance
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_payload = payload
+
+    if best_payload and best_similarity >= settings.semantic_cache_threshold:
+        logger.info("Semantic cache hit (score=%.3f)", best_similarity)
+        return json.loads(best_payload)
+
     return None
 
-def set_semantic(query_vec: list[float], query: str, response: dict, embedding_mode: str) -> None:
-    h = hashlib.md5(query.encode()).hexdigest()[:8]
-    pool = _semantic_index.setdefault(embedding_mode, [])
-    pool.append((query_vec, h, response))
-    if len(pool) > 5000: # cap memory
-        pool.pop(0)
+
+def set_semantic(
+    query_vec: list[float],
+    query: str,
+    collection_key: str,
+    params_key: str,
+    response: dict,
+) -> None:
+    if _client is None:
+        return
+    if not _ensure_semantic_index():
+        return
+
+    key = f"{SEMANTIC_PREFIX}{uuid.uuid4().hex}"
+    payload = json.dumps(response)
+
+    _client.hset(
+        key,
+        mapping={
+            "query": query,
+            COLLECTION_FIELD: collection_key,
+            PARAMS_FIELD: params_key,
+            VECTOR_FIELD: _vector_bytes(query_vec),
+            PAYLOAD_FIELD: payload,
+        },
+    )
+    _client.expire(key, settings.cache_ttl_seconds)
+
 
 def cache_connected() -> bool:
+    if _client is None:
+        return False
     try:
-        return bool(_cache_client.ping())
+        return bool(_client.ping())
     except Exception:
         return False
 
+
+def _info_to_dict(raw: list) -> dict:
+    info = {}
+    if not raw:
+        return info
+    for i in range(0, len(raw), 2):
+        key = _decode(raw[i]) or ""
+        info[key] = raw[i + 1]
+    return info
+
+
 def get_cache_stats() -> dict:
-    stats = {}
-    if isinstance(_cache_client, InMemoryCache):
-        stats["system"] = "in-memory (python dictionary)"
-        stats["exact_matches_cached"] = len(_cache_client._store)
-    else:
-        stats["system"] = "redis"
-        try:
-            stats["exact_matches_cached"] = _cache_client.dbsize()
-        except:
-            stats["exact_matches_cached"] = "unknown"
-            
-    stats["semantic_matches_cached"] = sum(len(v) for v in _semantic_index.values())
+    if _client is None:
+        return {"system": "disabled", "exact_matches_cached": 0, "semantic_matches_cached": 0}
+
+    stats = {"system": "redis"}
+    try:
+        stats["exact_matches_cached"] = _client.dbsize()
+    except Exception:
+        stats["exact_matches_cached"] = "unknown"
+
+    try:
+        info = _client.execute_command("FT.INFO", SEMANTIC_INDEX)
+        info_map = _info_to_dict(info)
+        num_docs = info_map.get("num_docs", 0)
+        stats["semantic_matches_cached"] = int(num_docs) if num_docs is not None else 0
+    except Exception:
+        stats["semantic_matches_cached"] = "unknown"
+
     return stats
+
 
 print("[cache] Module ready")

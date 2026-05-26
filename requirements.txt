@@ -35,7 +35,7 @@ tiktoken>=0.7.0
 # Document loading
 pypdf>=4.2.0
 
-# Caching (Redis optional — falls back to in-memory)
+# Caching (Redis required for Try Docs cache; use Redis Stack for vector search)
 redis>=5.0.0
 
 # Utilities

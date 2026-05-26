@@ -7,6 +7,7 @@ Core RAG query pipeline:
 5. Generate answer (sync or streaming)
 6. Return answer + sources
 """
+import hashlib
 import logging
 import re
 import time
@@ -23,7 +24,13 @@ from .retriever import retrieve, detect_query_scope, multi_collection_retrieve
 from .vector_store import resolve_embedding_mode_for_collections
 from .memory import resolve_standalone_question,trim_history_to_budget, build_lc_messages
 from .guardrails import check_query, check_context, redact_pii
-from .cache import get_exact,set_exact,get_semantic,set_semantic
+from .cache import (
+    CACHE_EMBEDDING_MODE,
+    get_exact,
+    set_exact,
+    get_semantic,
+    set_semantic,
+)
 from .embeddings import embed_query
 
 logger = logging.getLogger(__name__)
@@ -52,6 +59,21 @@ def _should_preserve_exact_reference(query: str) -> bool:
     e.g. "7.14 exclusion". Rewriting often dilutes these anchors.
     """
     return bool(_SECTION_REF_RE.search(query) and _SECTION_HINT_RE.search(query))
+
+
+def _is_try_docs_scope(collections: list[str]) -> bool:
+    prefix = settings.try_docs_prefix
+    return bool(collections) and all(c.startswith(prefix) for c in collections)
+
+
+def _cache_collection_key(collections: list[str]) -> str:
+    raw = "|".join(sorted(collections))
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _cache_params_key(mode: str, top_k: Optional[int]) -> str:
+    k = top_k if top_k is not None else settings.top_k_rerank
+    return f"{mode}:{k}"
 
 # Query rewriting
 async def rewrite_query(query: str) -> str:
@@ -170,6 +192,11 @@ async def query(
 
     collections = request.doc_collections or [request.collection_name]
     embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
+    mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
+    cache_allowed = settings.cache_enabled and _is_try_docs_scope(collections)
+    cache_collection_key = _cache_collection_key(collections)
+    cache_params_key = _cache_params_key(mode_val, request.top_k)
+    cache_query_vec = None
 
     # 1. Input guardrail
     guard = check_query(request.query)
@@ -182,8 +209,8 @@ async def query(
         )
     
     # 2. Exact cache check
-    if settings.cache_enabled:
-        cached = get_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode)
+    if cache_allowed:
+        cached = get_exact(request.query, cache_collection_key, cache_params_key)
         if cached:
             logger.info(f"Exact cache hit for query: '{request.query}'")
             cached["cached"] = True
@@ -191,9 +218,9 @@ async def query(
             return QueryResponse(**cached)
     
     # 3. Embed query for semantic cache + later retrieval
-    query_vec = await embed_query(request.query, embedding_mode)
-    if settings.cache_enabled:
-        semantic_hit = get_semantic(query_vec, embedding_mode)
+    if cache_allowed:
+        cache_query_vec = await embed_query(request.query, CACHE_EMBEDDING_MODE)
+        semantic_hit = get_semantic(cache_query_vec, cache_collection_key, cache_params_key)
         if semantic_hit:
             logger.info(f"Semantic cache hit for query: '{request.query}'")
             semantic_hit["cached"] = True
@@ -294,10 +321,12 @@ async def query(
     )
 
     # 9. Cache the result
-    if settings.cache_enabled:
+    if cache_allowed:
         result_dict = result.model_dump()
-        set_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode, result_dict)
-        set_semantic(query_vec, request.query, result_dict, embedding_mode)
+        set_exact(request.query, cache_collection_key, cache_params_key, result_dict)
+        if cache_query_vec is None:
+            cache_query_vec = await embed_query(request.query, CACHE_EMBEDDING_MODE)
+        set_semantic(cache_query_vec, request.query, cache_collection_key, cache_params_key, result_dict)
 
     return result
 
@@ -337,6 +366,9 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
     mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
     collections = request.doc_collections or [request.collection_name]
     embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
+    cache_allowed = settings.cache_enabled and _is_try_docs_scope(collections)
+    cache_collection_key = _cache_collection_key(collections)
+    cache_params_key = _cache_params_key(mode_val, request.top_k)
 
     yield emit("pipeline_start", "in_progress", {
         "query": request.query,
@@ -360,9 +392,9 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
         yield emit("guardrail_check", "passed", {})
 
         # --- Cache check ---
-        query_vec = None
-        if settings.cache_enabled:
-            cached = get_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode)
+        cache_query_vec = None
+        if cache_allowed:
+            cached = get_exact(request.query, cache_collection_key, cache_params_key)
             if cached:
                 cached["cached"] = True
                 cached["latency_ms"] = round((time.monotonic() - start) * 1000, 2)
@@ -371,8 +403,8 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                 yield "data: [DONE]\n\n"
                 return
 
-            query_vec = await embed_query(request.query, embedding_mode)
-            semantic_hit = get_semantic(query_vec, embedding_mode)
+            cache_query_vec = await embed_query(request.query, CACHE_EMBEDDING_MODE)
+            semantic_hit = get_semantic(cache_query_vec, cache_collection_key, cache_params_key)
             if semantic_hit:
                 semantic_hit["cached"] = True
                 semantic_hit["latency_ms"] = round((time.monotonic() - start) * 1000, 2)
@@ -508,7 +540,7 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
         sources_data = [s.model_dump() for s in sources]
 
         # Cache result — failure must not crash the stream
-        if settings.cache_enabled:
+        if cache_allowed:
             try:
                 result_dict = {
                     "answer": full_answer,
@@ -519,10 +551,10 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                     "latency_ms": latency_ms,
                     "eval_scores": None,
                 }
-                if query_vec is None:
-                    query_vec = await embed_query(request.query, embedding_mode)
-                set_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode, result_dict)
-                set_semantic(query_vec, request.query, result_dict, embedding_mode)
+                if cache_query_vec is None:
+                    cache_query_vec = await embed_query(request.query, CACHE_EMBEDDING_MODE)
+                set_exact(request.query, cache_collection_key, cache_params_key, result_dict)
+                set_semantic(cache_query_vec, request.query, cache_collection_key, cache_params_key, result_dict)
             except Exception:
                 logger.warning("Cache write failed (non-fatal)", exc_info=True)
 
