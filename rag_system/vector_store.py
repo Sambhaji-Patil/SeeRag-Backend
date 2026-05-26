@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 
 from .config import get_settings
-from .embeddings import get_embeddings
+from .embeddings import get_embeddings, get_embedding_info
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -42,7 +42,18 @@ def load_or_create_store(collection: str = "default") -> FAISS:
             embeddings,
             allow_dangerous_deserialization=True,
         )
-        _stores[collection] = store
+        expected_dim = int(get_embedding_info()["dimensions"])
+        if store.index.d != expected_dim:
+            logger.error(
+                "Embedding dim mismatch for collection '%s': index dim=%s, expected=%s. "
+                "Re-ingest with force_reindex or delete the collection.",
+                collection,
+                store.index.d,
+                expected_dim,
+            )
+            _stores[collection] = None
+        else:
+            _stores[collection] = store
     else:
         logger.warning(f"No index at {path}. Will create on first Ingest.")
         _stores[collection] = None

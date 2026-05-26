@@ -9,10 +9,12 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1
     llm_max_tokens: int = 1024
 
-    #bge embeddings 
+    # Embeddings (GPU vs CPU auto selection)
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     embedding_dimensions: int = 1024
-    embedding_device: str = "cuda"
+    embedding_model_cpu: str = "BAAI/bge-small-en-v1.5"
+    embedding_dimensions_cpu: int = 384
+    embedding_device: str = "auto"
     embedding_batch_size: int = 32
     embedding_normalize: bool = True
 
@@ -75,4 +77,9 @@ def get_settings() -> Settings:
     return Settings()
 
 settings = get_settings()
-print(f"[Config] Loaded. Model: {settings.chat_model}, Embedding Model: {settings.embedding_model},EmbedDim: {settings.embedding_dimensions}")
+print(
+    "[Config] Loaded. Model: "
+    f"{settings.chat_model}, Embedding GPU: {settings.embedding_model} ({settings.embedding_dimensions}), "
+    f"Embedding CPU: {settings.embedding_model_cpu} ({settings.embedding_dimensions_cpu}), "
+    f"Device: {settings.embedding_device}"
+)

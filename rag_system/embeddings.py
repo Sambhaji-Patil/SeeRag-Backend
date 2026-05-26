@@ -1,10 +1,11 @@
 """
-Local embedding model: BAAI/bge-large-en-v1.5
-- 1024-dim output, consistently top-ranked on MTEB leaderboard
+Local embedding model with GPU/CPU auto selection.
+- GPU: BAAI/bge-large-en-v1.5 (1024-dim output)
+- CPU fallback: BAAI/bge-small-en-v1.5 (384-dim output)
 - Runs fully local via sentence-transformers — zero API calls, zero cost
 - BGE requires a special query prefix: 'Represent this sentence for searching'
-  (documents are embedded as-is; only queries get the prefix)
-- LangChain's HuggingFaceBgeEmbeddings handles the prefix automatically
+    (documents are embedded as-is; only queries get the prefix)
+- LangChain's HuggingFaceEmbeddings handles the prefix automatically
 """
 
 import asyncio
@@ -30,45 +31,80 @@ warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
+def _resolve_device() -> str:
+    device = (settings.embedding_device or "auto").lower()
+    if device == "auto":
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            logger.warning("Torch unavailable or CUDA check failed; falling back to CPU")
+        return "cpu"
+
+    if device != "cpu":
+        try:
+            import torch
+            if device == "cuda" and not torch.cuda.is_available():
+                logger.warning("CUDA requested but not available; falling back to CPU")
+                return "cpu"
+        except Exception:
+            logger.warning("Torch unavailable or CUDA check failed; falling back to CPU")
+            return "cpu"
+
+    return device
+
+
+def _select_embedding_config() -> tuple[str, int, str]:
+    device = _resolve_device()
+    if device == "cpu":
+        model_name = settings.embedding_model_cpu or settings.embedding_model
+        dimensions = settings.embedding_dimensions_cpu or settings.embedding_dimensions
+    else:
+        model_name = settings.embedding_model
+        dimensions = settings.embedding_dimensions
+
+    return model_name, dimensions, device
+
+
+def get_embedding_info() -> dict[str, str | int]:
+    model_name, dimensions, device = _select_embedding_config()
+    return {
+        "model_name": model_name,
+        "dimensions": dimensions,
+        "device": device,
+    }
+
+
 @lru_cache(maxsize=1)
 def get_embeddings() -> HuggingFaceEmbeddings:
     """
-    Singleton BGE embedding model
+    Singleton embedding model
 
     encode_kwargs:
-        normalize_embeddings=True -> required for BGE Cosine similarity to work correctly
+        normalize_embeddings=True -> required for cosine similarity to work correctly
     
     query_encode_kwargs:
         BGE was finetuned with an instruction-like query prefix.
         We pass that prefix for query encoding only; documents remain unchanged.
     """
-    device = settings.embedding_device
-    if device and device != "cpu":
-        try:
-            import torch
-            if device == "cuda" and not torch.cuda.is_available():
-                logger.warning("CUDA requested but not available; falling back to CPU")
-                device = "cpu"
-        except Exception:
-            logger.warning("Torch unavailable or CUDA check failed; falling back to CPU")
-            device = "cpu"
+    model_name, dimensions, device = _select_embedding_config()
 
-    device = device or "cpu"
-    logger.info(f"Loading BGE model: {settings.embedding_model} on {device}")
+    logger.info(f"Loading embedding model: {model_name} on {device}")
     model = HuggingFaceEmbeddings(
-        model_name = settings.embedding_model,
+        model_name=model_name,
         model_kwargs={
             "device": device,
         },
         encode_kwargs={
             "normalize_embeddings": settings.embedding_normalize,
-            "batch_size": settings.embedding_batch_size
+            "batch_size": settings.embedding_batch_size,
         },
         query_encode_kwargs={
             "prompt": "Represent this sentence for searching relevant passages: ",
         },
     )
-    logger.info(f"BGE model loaded. Output dim={settings.embedding_dimensions}")
+    logger.info(f"Embedding model loaded. Output dim={dimensions}")
     return model
 
 #Async wrappers
@@ -114,5 +150,5 @@ def cosine_similarity(a:list[float],b:list[float]) -> float:
         return 0.0
     return float(np.dot(a_np,b_np)/denom)
 
-print("[embeddings] BGE module ready. Model will load on first embed call")
+print("[embeddings] Module ready. Model will load on first embed call")
 #the model can be preloaded using a warmup call at start
