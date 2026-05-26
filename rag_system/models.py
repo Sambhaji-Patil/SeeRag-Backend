@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 from enum import Enum
 import uuid
 
@@ -9,6 +9,8 @@ class RetrievalMode(str, Enum):
     HYBRID = "hybrid"
     MMR = "mmr"
 
+EmbeddingMode = Literal["bge-large", "bge-small", "openai-small", "auto"]
+
 # Ingestion 
 
 class IngestRequest(BaseModel):
@@ -16,6 +18,7 @@ class IngestRequest(BaseModel):
     metadatas: Optional[list[dict[str,Any]]] =  None
     collection_name: str = Field(default="default",pattern=r"^[a-z0-9_-]+$")
     force_reindex: bool = False
+    embedding_mode: Optional[EmbeddingMode] = None
 
     @field_validator("texts")
     @classmethod
@@ -42,6 +45,7 @@ class QueryRequest(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     collection_name: str = Field(default="default")
     retrieval_mode: RetrievalMode = RetrievalMode.HYBRID
+    embedding_mode: Optional[EmbeddingMode] = None
     top_k: Optional[int] = None
     doc_collections: Optional[list[str]] = None  # per-doc sub-collections; None = legacy single-collection mode
     history: list[ChatMessage] = Field(default_factory=list)

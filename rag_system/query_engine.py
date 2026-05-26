@@ -20,6 +20,7 @@ from .config import get_settings
 from .prompt import SYSTEM_PROMPT, QUERY_REWRITE_PROMPT, MULTI_DOC_SYSTEM_PROMPT
 from .models import QueryRequest, QueryResponse, SourceDocument
 from .retriever import retrieve, detect_query_scope, multi_collection_retrieve
+from .vector_store import resolve_embedding_mode_for_collections
 from .memory import resolve_standalone_question,trim_history_to_budget, build_lc_messages
 from .guardrails import check_query, check_context, redact_pii
 from .cache import get_exact,set_exact,get_semantic,set_semantic
@@ -167,6 +168,9 @@ async def query(
 ) -> QueryResponse:
     start = time.monotonic()
 
+    collections = request.doc_collections or [request.collection_name]
+    embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
+
     # 1. Input guardrail
     guard = check_query(request.query)
     if not guard.allowed:
@@ -179,7 +183,7 @@ async def query(
     
     # 2. Exact cache check
     if settings.cache_enabled:
-        cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
+        cached = get_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode)
         if cached:
             logger.info(f"Exact cache hit for query: '{request.query}'")
             cached["cached"] = True
@@ -187,9 +191,9 @@ async def query(
             return QueryResponse(**cached)
     
     # 3. Embed query for semantic cache + later retrieval
-    query_vec = await embed_query(request.query)
+    query_vec = await embed_query(request.query, embedding_mode)
     if settings.cache_enabled:
-        semantic_hit = get_semantic(query_vec)
+        semantic_hit = get_semantic(query_vec, embedding_mode)
         if semantic_hit:
             logger.info(f"Semantic cache hit for query: '{request.query}'")
             semantic_hit["cached"] = True
@@ -211,7 +215,6 @@ async def query(
         retrieval_query = await rewrite_query(standalone)
     
     # 6. Retrieve — multi-doc aware
-    collections = request.doc_collections or [request.collection_name]
     if len(collections) > 1:
         scoped = detect_query_scope(retrieval_query, collections)
         k_per = max(3, (request.top_k or settings.top_k_rerank) // len(scoped))
@@ -293,8 +296,8 @@ async def query(
     # 9. Cache the result
     if settings.cache_enabled:
         result_dict = result.model_dump()
-        set_exact(request.query, request.collection_name, request.retrieval_mode, result_dict)
-        set_semantic(query_vec,request.query, result_dict)
+        set_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode, result_dict)
+        set_semantic(query_vec, request.query, result_dict, embedding_mode)
 
     return result
 
@@ -332,11 +335,14 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
 
     start = time.monotonic()
     mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
+    collections = request.doc_collections or [request.collection_name]
+    embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
 
     yield emit("pipeline_start", "in_progress", {
         "query": request.query,
         "collection": request.collection_name,
         "mode": mode_val,
+        "embedding_mode": embedding_mode,
     })
 
     try:
@@ -356,7 +362,7 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
         # --- Cache check ---
         query_vec = None
         if settings.cache_enabled:
-            cached = get_exact(request.query, request.collection_name, request.retrieval_mode)
+            cached = get_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode)
             if cached:
                 cached["cached"] = True
                 cached["latency_ms"] = round((time.monotonic() - start) * 1000, 2)
@@ -365,8 +371,8 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                 yield "data: [DONE]\n\n"
                 return
 
-            query_vec = await embed_query(request.query)
-            semantic_hit = get_semantic(query_vec)
+            query_vec = await embed_query(request.query, embedding_mode)
+            semantic_hit = get_semantic(query_vec, embedding_mode)
             if semantic_hit:
                 semantic_hit["cached"] = True
                 semantic_hit["latency_ms"] = round((time.monotonic() - start) * 1000, 2)
@@ -398,7 +404,6 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
             })
 
         # --- Document routing (multi-doc) ---
-        collections = request.doc_collections or [request.collection_name]
         if len(collections) > 1:
             scoped = detect_query_scope(retrieval_query, collections)
             is_multi = len(scoped) > 1
@@ -515,9 +520,9 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                     "eval_scores": None,
                 }
                 if query_vec is None:
-                    query_vec = await embed_query(request.query)
-                set_exact(request.query, request.collection_name, request.retrieval_mode, result_dict)
-                set_semantic(query_vec, request.query, result_dict)
+                    query_vec = await embed_query(request.query, embedding_mode)
+                set_exact(request.query, request.collection_name, request.retrieval_mode, embedding_mode, result_dict)
+                set_semantic(query_vec, request.query, result_dict, embedding_mode)
             except Exception:
                 logger.warning("Cache write failed (non-fatal)", exc_info=True)
 

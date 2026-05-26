@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1024
     embedding_model_cpu: str = "BAAI/bge-small-en-v1.5"
     embedding_dimensions_cpu: int = 384
+    embedding_model_openai: str = "text-embedding-3-small"
+    embedding_dimensions_openai: int = 1536
     embedding_device: str = "auto"
     embedding_batch_size: int = 32
     embedding_normalize: bool = True
@@ -81,5 +83,6 @@ print(
     "[Config] Loaded. Model: "
     f"{settings.chat_model}, Embedding GPU: {settings.embedding_model} ({settings.embedding_dimensions}), "
     f"Embedding CPU: {settings.embedding_model_cpu} ({settings.embedding_dimensions_cpu}), "
+    f"Embedding OpenAI: {settings.embedding_model_openai} ({settings.embedding_dimensions_openai}), "
     f"Device: {settings.embedding_device}"
 )

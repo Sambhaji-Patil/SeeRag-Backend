@@ -63,20 +63,20 @@ def _build_redis_client():
 _cache_client = _build_redis_client()
 
 # Exact match cache
-def _cache_key(query: str, collection: str, mode: str) -> str:
-    payload = f"{query}::{collection}::{mode}"
+def _cache_key(query: str, collection: str, mode: str, embedding_mode: str) -> str:
+    payload = f"{query}::{collection}::{mode}::{embedding_mode}"
     return "rag:exact:" + hashlib.sha256(payload.encode()).hexdigest()[:32]
 
-def get_exact(query: str, collection: str, mode: str) -> Optional[dict]:
-    key = _cache_key(query, collection, mode)
+def get_exact(query: str, collection: str, mode: str, embedding_mode: str) -> Optional[dict]:
+    key = _cache_key(query, collection, mode, embedding_mode)
     raw = _cache_client.get(key)
     if raw:
         logger.debug(f"Exact cache hit: {key[:16]}...")
         return json.loads(raw)
     return None
 
-def set_exact(query: str, collection: str, mode: str, value: str) -> None:
-    key = _cache_key(query,collection,mode)
+def set_exact(query: str, collection: str, mode: str, embedding_mode: str, value: str) -> None:
+    key = _cache_key(query, collection, mode, embedding_mode)
     serialized = json.dumps(value)
     if hasattr(_cache_client,"setex"):
         _cache_client.setex(key,settings.cache_ttl_seconds,serialized)
@@ -85,13 +85,14 @@ def set_exact(query: str, collection: str, mode: str, value: str) -> None:
 
 # Semantic Cache
 # stores (embedding, serialized_response) pairs keyed by short hash
-_semantic_index: list[tuple[list[float],str,dict]] = [] # (vec,key,response)
+_semantic_index: dict[str, list[tuple[list[float],str,dict]]] = {} # mode -> (vec,key,response)
 
-def get_semantic(query_vec: list[float]) -> Optional[dict]:
+def get_semantic(query_vec: list[float], embedding_mode: str) -> Optional[dict]:
     """Return the cache response if cosine similarity > threshold"""
+    pool = _semantic_index.get(embedding_mode, [])
     best_score = 0.0
     best_response = None
-    for vec, _,response in _semantic_index:
+    for vec, _,response in pool:
         score = cosine_similarity(query_vec,vec)
         if score > best_score:
             best_score = score
@@ -101,11 +102,12 @@ def get_semantic(query_vec: list[float]) -> Optional[dict]:
         return best_response
     return None
 
-def set_semantic(query_vec: list[float], query: str, response: dict) -> None:
+def set_semantic(query_vec: list[float], query: str, response: dict, embedding_mode: str) -> None:
     h = hashlib.md5(query.encode()).hexdigest()[:8]
-    _semantic_index.append((query_vec, h, response))
-    if len(_semantic_index) > 5000: # cap memory
-        _semantic_index.pop(0)
+    pool = _semantic_index.setdefault(embedding_mode, [])
+    pool.append((query_vec, h, response))
+    if len(pool) > 5000: # cap memory
+        pool.pop(0)
 
 def cache_connected() -> bool:
     try:
@@ -125,7 +127,7 @@ def get_cache_stats() -> dict:
         except:
             stats["exact_matches_cached"] = "unknown"
             
-    stats["semantic_matches_cached"] = len(_semantic_index)
+    stats["semantic_matches_cached"] = sum(len(v) for v in _semantic_index.values())
     return stats
 
 print("[cache] Module ready")

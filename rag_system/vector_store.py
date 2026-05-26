@@ -1,4 +1,5 @@
 #faiss index management
+import json
 import logging
 import time
 import os
@@ -10,7 +11,13 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 
 from .config import get_settings
-from .embeddings import get_embeddings, get_embedding_info
+from .embeddings import (
+    get_embeddings,
+    get_embedding_info,
+    get_default_embedding_mode,
+    infer_embedding_mode_from_dim,
+    normalize_embedding_mode,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -18,6 +25,76 @@ settings = get_settings()
 _stores: dict[str, FAISS] = {}
 # Tracks last-used timestamp per collection (epoch seconds) for TTL-based cleanup
 _last_used: dict[str, float] = {}
+_collection_embeddings: dict[str, str] = {}
+
+_EMBEDDING_META_FILE = "embedding.json"
+
+
+def _embedding_meta_path(collection: str) -> Path:
+    return Path(_index_path(collection)) / _EMBEDDING_META_FILE
+
+
+def _read_embedding_meta(collection: str) -> dict | None:
+    meta_path = _embedding_meta_path(collection)
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read embedding metadata for '%s'", collection)
+        return None
+
+
+def _write_embedding_meta(collection: str, info: dict) -> None:
+    meta_path = _embedding_meta_path(collection)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+
+
+def get_collection_embedding_mode(collection: str) -> Optional[str]:
+    if collection in _collection_embeddings:
+        return _collection_embeddings[collection]
+
+    meta = _read_embedding_meta(collection)
+    if meta and isinstance(meta, dict):
+        mode = meta.get("mode") or meta.get("embedding_mode")
+        if isinstance(mode, str):
+            _collection_embeddings[collection] = mode
+            return mode
+    return None
+
+
+def resolve_embedding_mode_for_collections(
+    collections: list[str],
+    requested_mode: Optional[str] = None,
+) -> str:
+    requested = None
+    if requested_mode and requested_mode != "auto":
+        requested = normalize_embedding_mode(requested_mode)
+
+    modes = []
+    for coll in collections:
+        mode = get_collection_embedding_mode(coll)
+        if mode:
+            modes.append(mode)
+
+    if requested and modes and any(m != requested for m in modes):
+        logger.warning(
+            "Embedding mode mismatch (requested=%s, existing=%s). Using existing.",
+            requested,
+            sorted(set(modes)),
+        )
+        return modes[0]
+
+    if requested:
+        return requested
+
+    if modes:
+        if any(m != modes[0] for m in modes):
+            logger.warning("Multiple embedding modes across collections: %s", sorted(set(modes)))
+        return modes[0]
+
+    return get_default_embedding_mode()
 
 def _index_path(collection: str) -> str:
     return str(Path(settings.faiss_index_path)/ collection)
@@ -33,7 +110,8 @@ def load_or_create_store(collection: str = "default") -> FAISS:
         return _stores[collection]
 
     path = _index_path(collection)
-    embeddings = get_embeddings()
+    embedding_mode = resolve_embedding_mode_for_collections([collection])
+    embeddings = get_embeddings(embedding_mode)
 
     if Path(path).exists():
         logger.info(f"Loading FAISS index from {path}")
@@ -42,7 +120,19 @@ def load_or_create_store(collection: str = "default") -> FAISS:
             embeddings,
             allow_dangerous_deserialization=True,
         )
-        expected_dim = int(get_embedding_info()["dimensions"])
+        expected_dim = int(get_embedding_info(embedding_mode)["dimensions"])
+        if store.index.d != expected_dim:
+            inferred_mode = infer_embedding_mode_from_dim(store.index.d)
+            if inferred_mode and inferred_mode != embedding_mode:
+                embeddings = get_embeddings(inferred_mode)
+                store = FAISS.load_local(
+                    path,
+                    embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                embedding_mode = inferred_mode
+                expected_dim = int(get_embedding_info(embedding_mode)["dimensions"])
+
         if store.index.d != expected_dim:
             logger.error(
                 "Embedding dim mismatch for collection '%s': index dim=%s, expected=%s. "
@@ -54,6 +144,8 @@ def load_or_create_store(collection: str = "default") -> FAISS:
             _stores[collection] = None
         else:
             _stores[collection] = store
+            _collection_embeddings[collection] = embedding_mode
+            _write_embedding_meta(collection, get_embedding_info(embedding_mode))
     else:
         logger.warning(f"No index at {path}. Will create on first Ingest.")
         _stores[collection] = None
@@ -65,7 +157,8 @@ def load_or_create_store(collection: str = "default") -> FAISS:
 def add_documents(
     docs: list[Document],
     collection: str = "default",
-    force_reindex: bool = False
+    force_reindex: bool = False,
+    embedding_mode: Optional[str] = None,
 ) -> FAISS:
     """
     Adding docs to a FAISS collection.
@@ -73,7 +166,15 @@ def add_documents(
     - Persists to disk after every write
     """
 
-    embeddings = get_embeddings()
+    existing_mode = get_collection_embedding_mode(collection)
+    selected_mode = resolve_embedding_mode_for_collections([collection], embedding_mode)
+    if existing_mode and existing_mode != selected_mode and not force_reindex:
+        raise ValueError(
+            f"Embedding mode mismatch for '{collection}': existing={existing_mode}, requested={selected_mode}. "
+            "Use force_reindex to rebuild."
+        )
+
+    embeddings = get_embeddings(selected_mode)
     path = _index_path(collection)
 
     existing = None if force_reindex else _stores.get(collection)
@@ -93,6 +194,8 @@ def add_documents(
     store.save_local(path)
     _stores[collection] = store
     _last_used[collection] = time.time()
+    _collection_embeddings[collection] = selected_mode
+    _write_embedding_meta(collection, get_embedding_info(selected_mode))
     
     # Prebuild BM25 index on ingest
     from .retriever import _bm25_cache, _get_bm25
@@ -137,6 +240,9 @@ def get_collection_stats(collection: str) -> dict:
     store = load_or_create_store(collection)
     path = _index_path(collection)
 
+    embedding_mode = get_collection_embedding_mode(collection)
+    embedding_info = get_embedding_info(embedding_mode) if embedding_mode else None
+
     chunk_count = 0
     if store is not None and hasattr(store, "index"):
         chunk_count = store.index.ntotal
@@ -155,6 +261,9 @@ def get_collection_stats(collection: str) -> dict:
         "size_mb": size_mb,
         "loaded": store is not None,
         "index_path": path,
+        "embedding_mode": embedding_mode,
+        "embedding_dimensions": embedding_info["dimensions"] if embedding_info else None,
+        "embedding_provider": embedding_info["provider"] if embedding_info else None,
     }
 
 
@@ -179,6 +288,8 @@ def delete_collection(collection: str) -> bool:
     path = _index_path(collection)
     if collection in _stores:
         del _stores[collection]
+    if collection in _collection_embeddings:
+        del _collection_embeddings[collection]
 
     # Local import to avoid circular dependency with retriever
     from .retriever import _bm25_cache

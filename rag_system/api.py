@@ -20,12 +20,12 @@ from .document_processor import process_texts, process_file
 from .vector_store import (
     add_documents, load_or_create_store, is_loaded,
     list_collections, get_collection_stats, delete_collection,
-    cleanup_stale_collections,
+    cleanup_stale_collections, get_collection_embedding_mode,
 )
 from .query_engine import query as run_query, stream_query, pipeline_stream_query
 from .eval import evaluate
 from .cache import cache_connected, get_cache_stats
-from .embeddings import get_embeddings
+from .embeddings import get_embeddings, get_embeddings_runtime_info
 from .guardrails import _load_llama_guard
 from .retriever import _reranker
 
@@ -202,6 +202,11 @@ async def cache_stats():
     return get_cache_stats()
 
 
+@app.get("/embeddings/info", tags=["ops"])
+async def embeddings_info():
+    return get_embeddings_runtime_info()
+
+
 # ── Ingest ────────────────────────────────────────────────────────────────────
 
 @app.post("/ingest", response_model=IngestResponse, tags=["ingest"])
@@ -213,7 +218,12 @@ async def ingest_texts(req: IngestRequest):
             metadatas=req.metadatas,
             source_id=req.collection_name,
         )
-        add_documents(docs, collection=req.collection_name, force_reindex=req.force_reindex)
+        add_documents(
+            docs,
+            collection=req.collection_name,
+            force_reindex=req.force_reindex,
+            embedding_mode=req.embedding_mode,
+        )
         return IngestResponse(
             success=True,
             docs_indexed=len(docs),
@@ -229,6 +239,7 @@ async def ingest_texts(req: IngestRequest):
 async def ingest_file(
     file: UploadFile = File(...),
     collection_name: str = "default",
+    embedding_mode: str | None = None,
     background_tasks: BackgroundTasks = None,
 ):
     """
@@ -254,6 +265,7 @@ async def ingest_file(
         "status": "processing",
         "collection_name": doc_collection,
         "filename": file.filename,
+        "embedding_mode": embedding_mode,
         "chunks_created": 0,
         "message": "File received, extracting text...",
         "progress": 5,
@@ -267,7 +279,7 @@ async def ingest_file(
 
             _ingest_jobs[job_id]["progress"] = 60
             _ingest_jobs[job_id]["message"] = f"Embedding and indexing {len(docs)} chunks..."
-            add_documents(docs, collection=doc_collection)
+            add_documents(docs, collection=doc_collection, embedding_mode=embedding_mode)
             _viz_cache.pop(doc_collection, None)  # invalidate stale viz
 
             _ingest_jobs[job_id]["progress"] = 100
@@ -463,7 +475,8 @@ async def get_query_similarity(collection_name: str, body: dict = Body(...)):
 
     import numpy as np
 
-    q_vec = np.array(get_embeddings().embed_query(query), dtype=np.float32).reshape(1, -1)
+    embedding_mode = get_collection_embedding_mode(collection_name)
+    q_vec = np.array(get_embeddings(embedding_mode).embed_query(query), dtype=np.float32).reshape(1, -1)
     q_2d = result["pca"].transform(q_vec)[0]
 
     vectors = result["vectors"]

@@ -1,21 +1,21 @@
 """
-Local embedding model with GPU/CPU auto selection.
-- GPU: BAAI/bge-large-en-v1.5 (1024-dim output)
-- CPU fallback: BAAI/bge-small-en-v1.5 (384-dim output)
-- Runs fully local via sentence-transformers — zero API calls, zero cost
-- BGE requires a special query prefix: 'Represent this sentence for searching'
-    (documents are embedded as-is; only queries get the prefix)
-- LangChain's HuggingFaceEmbeddings handles the prefix automatically
+Local + API embedding models with GPU/CPU aware defaults.
+- BGE-large (1024-dim) for GPU
+- BGE-small (384-dim) for fast local CPU
+- OpenAI text-embedding-3-small (1536-dim) for fast CPU via API
+- BGE requires a special query prefix for queries only
 """
 
 import asyncio
 import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from typing import Any
 
 import numpy as np
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.embeddings import Embeddings
 from pydantic.warnings import UnsupportedFieldAttributeWarning
 
 from .config import get_settings
@@ -30,6 +30,10 @@ warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
 #inside async contexts without blocking the event loop
 
 _executor = ThreadPoolExecutor(max_workers=2)
+
+EMBEDDING_MODES: tuple[str, ...] = ("bge-large", "bge-small", "openai-small")
+_EMBEDDING_CACHE: dict[str, Embeddings] = {}
+
 
 def _resolve_device() -> str:
     device = (settings.embedding_device or "auto").lower()
@@ -55,31 +59,84 @@ def _resolve_device() -> str:
     return device
 
 
-def _select_embedding_config() -> tuple[str, int, str]:
-    device = _resolve_device()
-    if device == "cpu":
-        model_name = settings.embedding_model_cpu or settings.embedding_model
-        dimensions = settings.embedding_dimensions_cpu or settings.embedding_dimensions
-    else:
-        model_name = settings.embedding_model
-        dimensions = settings.embedding_dimensions
-
-    return model_name, dimensions, device
+def get_default_embedding_mode() -> str:
+    return "bge-large" if _resolve_device() == "cuda" else "openai-small"
 
 
-def get_embedding_info() -> dict[str, str | int]:
-    model_name, dimensions, device = _select_embedding_config()
+def normalize_embedding_mode(mode: str | None) -> str:
+    if mode is None or mode == "auto":
+        return get_default_embedding_mode()
+    if mode not in EMBEDDING_MODES:
+        raise ValueError(f"Unknown embedding mode: {mode}")
+    return mode
+
+
+def infer_embedding_mode_from_dim(dim: int) -> str | None:
+    dim_map = {
+        int(settings.embedding_dimensions): "bge-large",
+        int(settings.embedding_dimensions_cpu): "bge-small",
+        int(settings.embedding_dimensions_openai): "openai-small",
+    }
+    return dim_map.get(int(dim))
+
+
+def _embedding_spec(mode: str) -> dict[str, Any]:
+    if mode == "bge-large":
+        return {
+            "provider": "local",
+            "model_name": settings.embedding_model,
+            "dimensions": settings.embedding_dimensions,
+            "device": _resolve_device(),
+        }
+    if mode == "bge-small":
+        return {
+            "provider": "local",
+            "model_name": settings.embedding_model_cpu,
+            "dimensions": settings.embedding_dimensions_cpu,
+            "device": _resolve_device(),
+        }
     return {
-        "model_name": model_name,
-        "dimensions": dimensions,
-        "device": device,
+        "provider": "openai",
+        "model_name": settings.embedding_model_openai,
+        "dimensions": settings.embedding_dimensions_openai,
+        "device": "api",
     }
 
 
-@lru_cache(maxsize=1)
-def get_embeddings() -> HuggingFaceEmbeddings:
+def get_embedding_info(mode: str | None = None) -> dict[str, str | int]:
+    resolved = normalize_embedding_mode(mode)
+    spec = _embedding_spec(resolved)
+    return {
+        "mode": resolved,
+        "provider": spec["provider"],
+        "model_name": spec["model_name"],
+        "dimensions": int(spec["dimensions"]),
+        "device": spec["device"],
+    }
+
+
+def get_embeddings_runtime_info() -> dict[str, Any]:
+    default_mode = get_default_embedding_mode()
+    options = []
+    for mode in EMBEDDING_MODES:
+        info = get_embedding_info(mode)
+        options.append({
+            "id": mode,
+            "model_name": info["model_name"],
+            "dimensions": info["dimensions"],
+            "provider": info["provider"],
+            "recommended": mode == default_mode,
+        })
+    return {
+        "default_mode": default_mode,
+        "device": _resolve_device(),
+        "options": options,
+    }
+
+
+def get_embeddings(mode: str | None = None) -> Embeddings:
     """
-    Singleton embedding model
+    Singleton embedding model per mode.
 
     encode_kwargs:
         normalize_embeddings=True -> required for cosine similarity to work correctly
@@ -88,23 +145,36 @@ def get_embeddings() -> HuggingFaceEmbeddings:
         BGE was finetuned with an instruction-like query prefix.
         We pass that prefix for query encoding only; documents remain unchanged.
     """
-    model_name, dimensions, device = _select_embedding_config()
+    resolved = normalize_embedding_mode(mode)
+    cached = _EMBEDDING_CACHE.get(resolved)
+    if cached is not None:
+        return cached
 
-    logger.info(f"Loading embedding model: {model_name} on {device}")
-    model = HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={
-            "device": device,
-        },
-        encode_kwargs={
-            "normalize_embeddings": settings.embedding_normalize,
-            "batch_size": settings.embedding_batch_size,
-        },
-        query_encode_kwargs={
-            "prompt": "Represent this sentence for searching relevant passages: ",
-        },
-    )
-    logger.info(f"Embedding model loaded. Output dim={dimensions}")
+    spec = _embedding_spec(resolved)
+    logger.info("Loading embedding model: %s on %s", spec["model_name"], spec["device"])
+    if spec["provider"] == "openai":
+        model = OpenAIEmbeddings(
+            model=spec["model_name"],
+            dimensions=int(spec["dimensions"]),
+            openai_api_key=settings.openai_api_key,
+        )
+    else:
+        model = HuggingFaceEmbeddings(
+            model_name=spec["model_name"],
+            model_kwargs={
+                "device": spec["device"],
+            },
+            encode_kwargs={
+                "normalize_embeddings": settings.embedding_normalize,
+                "batch_size": settings.embedding_batch_size,
+            },
+            query_encode_kwargs={
+                "prompt": "Represent this sentence for searching relevant passages: ",
+            },
+        )
+
+    logger.info("Embedding model loaded. Output dim=%s", spec["dimensions"])
+    _EMBEDDING_CACHE[resolved] = model
     return model
 
 #Async wrappers
@@ -113,9 +183,10 @@ def get_embeddings() -> HuggingFaceEmbeddings:
 
 async def embed_texts(
     texts: list[str],
-    batch_size: int = None
+    batch_size: int = None,
+    embedding_mode: str | None = None,
 ) -> list[list[float]]:
-    model = get_embeddings()
+    model = get_embeddings(embedding_mode)
     bs = batch_size or settings.embedding_batch_size
     loop = asyncio.get_event_loop()
 
@@ -132,8 +203,8 @@ async def embed_texts(
         logger.debug(f"Embedded batch {i}–{i + len(batch)} ({len(batch)} docs)")
     return all_embeddings
 
-async def embed_query(text: str) -> list[float]:
-    model = get_embeddings()
+async def embed_query(text: str, embedding_mode: str | None = None) -> list[float]:
+    model = get_embeddings(embedding_mode)
     loop = asyncio.get_event_loop()
     vec = await loop.run_in_executor(
         _executor,
