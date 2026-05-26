@@ -67,18 +67,18 @@ jobs:
               ],
           )
 
-            if os.path.isdir(faiss_path):
+          if os.path.isdir(faiss_path):
               upload_folder(
-                repo_id=repo_id,
-                folder_path=faiss_path,
-                path_in_repo=faiss_path,
-                repo_type="space",
-                token=token,
-                ignore_patterns=[
-                  "**/.DS_Store",
-                ],
+                  repo_id=repo_id,
+                  folder_path=faiss_path,
+                  path_in_repo=faiss_path,
+                  repo_type="space",
+                  token=token,
+                  ignore_patterns=[
+                      "**/.DS_Store",
+                  ],
               )
-            else:
+          else:
               print(f"FAISS folder not found: {faiss_path}")
 
           for extra in ("requirements.txt", "Dockerfile", "README.md"):
