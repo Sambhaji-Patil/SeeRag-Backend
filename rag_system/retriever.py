@@ -49,13 +49,30 @@ def bm25_retrieve(query: str, collection: str,k: int) -> list[tuple[Document,flo
 def _rrf_score(rank: int, k: int = 60) -> float:
     return 1.0 / (k + rank + 1) #here 1 is added to handle rank 1 which here comes as 0
 
+
+def _resolve_hybrid_weights(
+    bm25_weight: Optional[float],
+    vector_weight: Optional[float],
+) -> tuple[float, float]:
+    bw = settings.bm25_weight if bm25_weight is None else bm25_weight
+    vw = settings.vector_weight if vector_weight is None else vector_weight
+    total = bw + vw
+    if total <= 0:
+        bw = settings.bm25_weight
+        vw = settings.vector_weight
+        total = bw + vw
+    return bw / total, vw / total
+
 #Hybrid Retrieval
 def hybrid_retrieve(
     query: str,
     collection: str,
-    k: int
+    k: int,
+    bm25_weight: Optional[float] = None,
+    vector_weight: Optional[float] = None,
 ) -> list[tuple[Document,float]]:
     """Reciprocal Rank fusion of BM25 and Vector results"""
+    bw, vw = _resolve_hybrid_weights(bm25_weight, vector_weight)
     pool_size = k*3 #casting a wide net before fusing
     vec_results = similarity_search_with_scores(query,collection,k=pool_size)
     bm25_results = bm25_retrieve(query,collection,k=pool_size)
@@ -65,12 +82,12 @@ def hybrid_retrieve(
 
     for rank, (doc, _) in enumerate(vec_results):
         did = doc.metadata.get("doc_id",id(doc))
-        rrf_scores[did] = rrf_scores.get(did,0) + settings.vector_weight * _rrf_score(rank) #check the existing score first and then add the fresh score
+        rrf_scores[did] = rrf_scores.get(did,0) + vw * _rrf_score(rank) #check the existing score first and then add the fresh score
         doc_map[did] = doc
     
     for rank, (doc, _) in enumerate(bm25_results):
         did = doc.metadata.get("doc_id",id(doc))
-        rrf_scores[did] = rrf_scores.get(did,0) + settings.bm25_weight * _rrf_score(rank) 
+        rrf_scores[did] = rrf_scores.get(did,0) + bw * _rrf_score(rank) 
         doc_map[did] = doc
     
     sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:k]
@@ -81,14 +98,15 @@ async def mmr_retrieve(
     query: str,
     collection: str,
     k: int,
-    lambda_mult: float = None,
+    lambda_mult: Optional[float] = None,
+    fetch_k: Optional[int] = None,
 ) -> list[tuple[Document, float]]:
     """
     Maximal Marginal Relevance: balance relevance vs diversity.
     """
     # 1. Setup parameters
     lam = lambda_mult or settings.mmr_lambda
-    fetch_k = settings.top_k_retrieval
+    fetch_k = fetch_k or settings.top_k_retrieval
     store = get_store(collection)
 
     # 2. Get original scores to map them back later
@@ -195,10 +213,14 @@ async def retrieve(
     collection: str = "default",
     mode: str = "hybrid",
     top_k: Optional[int] = None,
+    top_k_retrieval: Optional[int] = None,
+    mmr_lambda: Optional[float] = None,
+    bm25_weight: Optional[float] = None,
+    vector_weight: Optional[float] = None,
     use_reranker: bool = True,
     expand_context: bool = True,
 ) -> list[tuple[Document,float]]:
-    k_retrieve = settings.top_k_retrieval
+    k_retrieve = top_k_retrieval or settings.top_k_retrieval
     k_final = top_k or settings.top_k_rerank
 
     if mode == "vector":
@@ -206,10 +228,16 @@ async def retrieve(
     elif mode == "bm25":
         results = bm25_retrieve(query,collection,k=k_retrieve)
     elif mode == "mmr":
-        results = await mmr_retrieve(query,collection,k=k_final)
+        results = await mmr_retrieve(query,collection,k=k_final,lambda_mult=mmr_lambda,fetch_k=k_retrieve)
         return results # MMR alrady handles diversity , skip reranker
     else: #go with hybrid
-        results = hybrid_retrieve(query,collection,k=k_retrieve)
+        results = hybrid_retrieve(
+            query,
+            collection,
+            k=k_retrieve,
+            bm25_weight=bm25_weight,
+            vector_weight=vector_weight,
+        )
 
     #Rerank
     if use_reranker:
@@ -259,6 +287,10 @@ async def multi_collection_retrieve(
     collections: list[str],
     mode: str = "hybrid",
     k_per_collection: int = 5,
+    top_k_retrieval: Optional[int] = None,
+    mmr_lambda: Optional[float] = None,
+    bm25_weight: Optional[float] = None,
+    vector_weight: Optional[float] = None,
     use_reranker: bool = True,
     expand_context: bool = True,
 ) -> list[tuple[Document, float]]:
@@ -275,6 +307,10 @@ async def multi_collection_retrieve(
                 collection=coll,
                 mode=mode,
                 top_k=k_per_collection,
+                top_k_retrieval=top_k_retrieval,
+                mmr_lambda=mmr_lambda,
+                bm25_weight=bm25_weight,
+                vector_weight=vector_weight,
                 use_reranker=False,   # defer reranking until after merge
                 expand_context=expand_context,
             )

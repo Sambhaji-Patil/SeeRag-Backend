@@ -101,6 +101,10 @@ def _exact_key(query: str, collection_key: str, params_key: str) -> str:
     return EXACT_PREFIX + hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
+def _tag_hash(value: str) -> str:
+    return hashlib.sha1(value.encode()).hexdigest()[:16]
+
+
 def _vector_bytes(vec: list[float]) -> bytes:
     return np.array(vec, dtype=np.float32).tobytes()
 
@@ -146,9 +150,10 @@ def get_semantic(query_vec: list[float], collection_key: str, params_key: str) -
 
     vec = _vector_bytes(query_vec)
     k = 4
+    params_tag = _tag_hash(params_key)
     query = (
         f"@{COLLECTION_FIELD}:{{{collection_key}}} "
-        f"@{PARAMS_FIELD}:{{{params_key}}}"
+        f"@{PARAMS_FIELD}:{{{params_tag}}} "
         f"=>[KNN {k} @{VECTOR_FIELD} $vec AS score]"
     )
 
@@ -223,7 +228,7 @@ def set_semantic(
         mapping={
             "query": query,
             COLLECTION_FIELD: collection_key,
-            PARAMS_FIELD: params_key,
+            PARAMS_FIELD: _tag_hash(params_key),
             VECTOR_FIELD: _vector_bytes(query_vec),
             PAYLOAD_FIELD: payload,
         },

@@ -71,9 +71,26 @@ def _cache_collection_key(collections: list[str]) -> str:
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
-def _cache_params_key(mode: str, top_k: Optional[int]) -> str:
-    k = top_k if top_k is not None else settings.top_k_rerank
-    return f"{mode}:{k}"
+def _fmt_param(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.3f}"
+
+
+def _cache_params_key_v2(
+    mode: str,
+    top_k: Optional[int],
+    top_k_retrieval: Optional[int],
+    mmr_lambda: Optional[float],
+    bm25_weight: Optional[float],
+    vector_weight: Optional[float],
+) -> str:
+    k_final = top_k if top_k is not None else settings.top_k_rerank
+    k_retrieve = top_k_retrieval if top_k_retrieval is not None else settings.top_k_retrieval
+    return (
+        f"{mode}:{k_final}:{k_retrieve}:"
+        f"{_fmt_param(mmr_lambda)}:{_fmt_param(bm25_weight)}:{_fmt_param(vector_weight)}"
+    )
 
 # Query rewriting
 async def rewrite_query(query: str) -> str:
@@ -195,7 +212,14 @@ async def query(
     mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
     cache_allowed = settings.cache_enabled and _is_try_docs_scope(collections)
     cache_collection_key = _cache_collection_key(collections)
-    cache_params_key = _cache_params_key(mode_val, request.top_k)
+    cache_params_key = _cache_params_key_v2(
+        mode_val,
+        request.top_k,
+        request.top_k_retrieval,
+        request.mmr_lambda,
+        request.bm25_weight,
+        request.vector_weight,
+    )
     cache_query_vec = None
 
     # 1. Input guardrail
@@ -250,6 +274,10 @@ async def query(
             collections=scoped,
             mode=request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode),
             k_per_collection=k_per,
+            top_k_retrieval=request.top_k_retrieval,
+            mmr_lambda=request.mmr_lambda,
+            bm25_weight=request.bm25_weight,
+            vector_weight=request.vector_weight,
             use_reranker=True,
             expand_context=True,
         )
@@ -260,6 +288,10 @@ async def query(
             collection=collections[0],
             mode=request.retrieval_mode,
             top_k=request.top_k,
+            top_k_retrieval=request.top_k_retrieval,
+            mmr_lambda=request.mmr_lambda,
+            bm25_weight=request.bm25_weight,
+            vector_weight=request.vector_weight,
             use_reranker=True,
             expand_context=True,
         )
@@ -368,7 +400,14 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
     embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
     cache_allowed = settings.cache_enabled and _is_try_docs_scope(collections)
     cache_collection_key = _cache_collection_key(collections)
-    cache_params_key = _cache_params_key(mode_val, request.top_k)
+    cache_params_key = _cache_params_key_v2(
+        mode_val,
+        request.top_k,
+        request.top_k_retrieval,
+        request.mmr_lambda,
+        request.bm25_weight,
+        request.vector_weight,
+    )
 
     yield emit("pipeline_start", "in_progress", {
         "query": request.query,
@@ -451,7 +490,8 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
         # --- Retrieval ---
         yield emit("retrieval_start", "in_progress", {
             "mode": mode_val,
-            "top_k": request.top_k or settings.top_k_retrieval,
+            "top_k": request.top_k or settings.top_k_rerank,
+            "top_k_retrieval": request.top_k_retrieval or settings.top_k_retrieval,
             "collections": len(scoped),
         })
 
@@ -462,6 +502,10 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                 collections=scoped,
                 mode=mode_val,
                 k_per_collection=k_per,
+                top_k_retrieval=request.top_k_retrieval,
+                mmr_lambda=request.mmr_lambda,
+                bm25_weight=request.bm25_weight,
+                vector_weight=request.vector_weight,
                 use_reranker=True,
                 expand_context=True,
             )
@@ -471,6 +515,10 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                 collection=scoped[0],
                 mode=request.retrieval_mode,
                 top_k=request.top_k,
+                top_k_retrieval=request.top_k_retrieval,
+                mmr_lambda=request.mmr_lambda,
+                bm25_weight=request.bm25_weight,
+                vector_weight=request.vector_weight,
                 use_reranker=True,
                 expand_context=True,
             )
