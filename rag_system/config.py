@@ -53,8 +53,9 @@ class Settings(BaseSettings):
     #api
     api_title: str = "Production RAG API"
     api_version: str = "1.0.0"
-    cors_origins: list[str] = ["*"]
+    cors_origins: list[str] = ["https://seerag.vercel.app"]
     rate_limit_per_minute: int = 60
+    api_bearer_token: str | None = None
 
     #guardrails
     guardrails_use_llama_guard: bool = True

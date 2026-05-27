@@ -1,12 +1,15 @@
 import logging
 import time
 import uuid as _uuid
+from hmac import compare_digest
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 
 from .config import get_settings
@@ -212,6 +215,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.middleware("http")
+async def require_bearer_token(request: Request, call_next):
+    if request.method == "OPTIONS" or not settings.api_bearer_token:
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token or not compare_digest(token.strip(), settings.api_bearer_token):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return await call_next(request)
 
 
 @app.middleware("http")

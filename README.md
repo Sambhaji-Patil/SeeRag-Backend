@@ -30,6 +30,8 @@ The FastAPI app listens on port 8000.
 
 Required:
 - OPENAI_API_KEY
+- API_BEARER_TOKEN (backend)
+- VITE_API_BEARER_TOKEN (frontend)
 
 Optional:
 - EMBEDDING_DEVICE (default: cuda)
