@@ -277,16 +277,29 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
             tokenized = _llama_guard_tokenizer(prompt, return_tensors="pt")
 
         if isinstance(tokenized, dict):
-            input_ids = tokenized["input_ids"].to(_llama_guard_model.device)
+            input_ids = tokenized.get("input_ids")
             attention_mask = tokenized.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(_llama_guard_model.device)
         else:
-            input_ids = tokenized.to(_llama_guard_model.device)
+            input_ids = tokenized
             attention_mask = None
 
+        if not hasattr(input_ids, "shape"):
+            import torch
+            input_ids = torch.as_tensor(input_ids)
+        if len(getattr(input_ids, "shape", [])) == 1:
+            input_ids = input_ids.unsqueeze(0)
+        input_ids = input_ids.to(_llama_guard_model.device)
+
         if attention_mask is None:
-            attention_mask = input_ids.new_ones(input_ids.shape)
+            import torch
+            attention_mask = torch.ones_like(input_ids)
+        else:
+            if not hasattr(attention_mask, "shape"):
+                import torch
+                attention_mask = torch.as_tensor(attention_mask)
+            if len(getattr(attention_mask, "shape", [])) == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            attention_mask = attention_mask.to(_llama_guard_model.device)
 
         prompt_len = input_ids.shape[1]
         output = _llama_guard_model.generate(

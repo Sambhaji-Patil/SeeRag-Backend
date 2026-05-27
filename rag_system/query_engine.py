@@ -72,11 +72,6 @@ def _should_preserve_exact_reference(query: str) -> bool:
     return bool(_SECTION_REF_RE.search(query) and _SECTION_HINT_RE.search(query))
 
 
-def _is_try_docs_scope(collections: list[str]) -> bool:
-    prefix = settings.try_docs_prefix
-    return bool(collections) and all(c.startswith(prefix) for c in collections)
-
-
 def _cache_collection_key(collections: list[str]) -> str:
     raw = "|".join(sorted(collections))
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
@@ -254,7 +249,7 @@ async def query(
     collections = request.doc_collections or [request.collection_name]
     embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
     mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
-    cache_allowed = settings.cache_enabled and _is_try_docs_scope(collections)
+    cache_allowed = settings.cache_enabled
     cache_collection_key = _cache_collection_key(collections)
     cache_params_key = _cache_params_key_v2(
         mode_val,
@@ -455,7 +450,7 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
     mode_val = request.retrieval_mode.value if hasattr(request.retrieval_mode, "value") else str(request.retrieval_mode)
     collections = request.doc_collections or [request.collection_name]
     embedding_mode = resolve_embedding_mode_for_collections(collections, request.embedding_mode)
-    cache_allowed = settings.cache_enabled and _is_try_docs_scope(collections)
+    cache_allowed = settings.cache_enabled
     cache_collection_key = _cache_collection_key(collections)
     cache_params_key = _cache_params_key_v2(
         mode_val,
