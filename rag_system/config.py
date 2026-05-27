@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     cache_enabled: bool = False
     redis_url: str = "redis://localhost:6379"
     cache_ttl_seconds: int = 3600
-    semantic_cache_threshold: float = 0.95
+    semantic_cache_threshold: float = 0.9
 
     #api
     api_title: str = "Production RAG API"

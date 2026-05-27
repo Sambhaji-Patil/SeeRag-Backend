@@ -8,6 +8,7 @@ Core RAG query pipeline:
 6. Return answer + sources
 """
 import hashlib
+import json
 import logging
 import re
 import time
@@ -52,6 +53,16 @@ _llm = _build_llm()
 _SECTION_REF_RE = re.compile(r"\b\d+\.\d+\b")
 _SECTION_HINT_RE = re.compile(r"\b(section|clause|exclusion|code|excl)\b", re.IGNORECASE)
 
+_RAG_DECISION_PROMPT = (
+    "You are a routing assistant for a retrieval-augmented chat system.\n"
+    "Decide if the user's question can be answered using ONLY the prior chat history.\n"
+    "If the history provides enough info to answer confidently, respond with JSON:\n"
+    '{"use_rag": false, "answer": "..."}\n'
+    "If not, respond with JSON:\n"
+    '{"use_rag": true, "answer": ""}\n'
+    "Rules: Use only chat history, do not guess. If unsure, set use_rag true. Output JSON only."
+)
+
 
 def _should_preserve_exact_reference(query: str) -> bool:
     """
@@ -91,6 +102,39 @@ def _cache_params_key_v2(
         f"{mode}:{k_final}:{k_retrieve}:"
         f"{_fmt_param(mmr_lambda)}:{_fmt_param(bm25_weight)}:{_fmt_param(vector_weight)}"
     )
+
+
+async def _decide_rag_or_answer(
+    question: str,
+    history: list[dict],
+    llm: ChatOpenAI,
+) -> tuple[bool, Optional[str]]:
+    if not history:
+        return True, None
+
+    messages = build_lc_messages(history, _RAG_DECISION_PROMPT)
+    messages.append(HumanMessage(content=f"User question: {question}"))
+
+    try:
+        response = await llm.ainvoke(messages)
+        raw = response.content.strip()
+        data = None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+        if not isinstance(data, dict):
+            return True, None
+        use_rag = bool(data.get("use_rag", True))
+        answer = data.get("answer") if not use_rag else None
+        if not use_rag and isinstance(answer, str) and answer.strip():
+            return False, answer.strip()
+        return True, None
+    except Exception:
+        logger.warning("RAG routing decision failed; defaulting to retrieval", exc_info=True)
+        return True, None
 
 # Query rewriting
 async def rewrite_query(query: str) -> str:
@@ -264,6 +308,19 @@ async def query(
         retrieval_query = await hyde_query_expansion(standalone)
     else:
         retrieval_query = await rewrite_query(standalone)
+
+    # 5.5 Decide if retrieval is needed based on chat history
+    use_rag, history_answer = await _decide_rag_or_answer(standalone, trimmed_history, _llm)
+    if not use_rag and history_answer:
+        latency_ms = round((time.monotonic() - start) * 1000, 2)
+        return QueryResponse(
+            answer=history_answer,
+            sources=[],
+            session_id=request.session_id,
+            rewritten_query=retrieval_query if retrieval_query != request.query else None,
+            cached=False,
+            latency_ms=latency_ms,
+        )
     
     # 6. Retrieve — multi-doc aware
     if len(collections) > 1:
@@ -474,6 +531,23 @@ async def pipeline_stream_query(request: QueryRequest) -> AsyncIterator[str]:
                 "rewritten": retrieval_query,
             })
 
+        use_rag, history_answer = await _decide_rag_or_answer(standalone, trimmed_history, _llm)
+        if not use_rag and history_answer:
+            latency_ms = round((time.monotonic() - start) * 1000, 2)
+            yield emit("rag_decision", "done", {"use_rag": False, "source": "history"})
+            yield emit("generation_start", "done", {"model": settings.chat_model, "source": "history"})
+            yield emit("complete", "done", {
+                "answer": history_answer,
+                "sources": [],
+                "rewritten_query": retrieval_query if retrieval_query != request.query else None,
+                "latency_ms": latency_ms,
+                "session_id": request.session_id,
+                "cached": False,
+            })
+            yield "data: [DONE]\n\n"
+            return
+        yield emit("rag_decision", "done", {"use_rag": True})
+
         # --- Document routing (multi-doc) ---
         if len(collections) > 1:
             scoped = detect_query_scope(retrieval_query, collections)
@@ -651,6 +725,13 @@ async def stream_query(request: QueryRequest) -> AsyncIterator[str]:
         logger.info("Skipping query rewrite to preserve section/clause reference: '%s'", standalone)
     else:
         retrieval_query = await rewrite_query(standalone)
+
+    history = [h.model_dump() for h in request.history]
+    trimmed_history = trim_history_to_budget(history)
+    use_rag, history_answer = await _decide_rag_or_answer(standalone, trimmed_history, _llm)
+    if not use_rag and history_answer:
+        yield f"data: {history_answer}\n\n"
+        return
     docs_with_scores = await retrieve(
         retrieval_query, request.collection_name, request.retrieval_mode.value
     )

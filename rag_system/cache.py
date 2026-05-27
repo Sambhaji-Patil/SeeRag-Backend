@@ -106,7 +106,11 @@ def _tag_hash(value: str) -> str:
 
 
 def _vector_bytes(vec: list[float]) -> bytes:
-    return np.array(vec, dtype=np.float32).tobytes()
+    arr = np.array(vec, dtype=np.float32)
+    norm = np.linalg.norm(arr)
+    if norm > 0:
+        arr = arr / norm
+    return arr.tobytes()
 
 
 def _decode(value: bytes | str | None) -> Optional[str]:

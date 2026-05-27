@@ -267,11 +267,26 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
     try:
         conversation = [{"role": "user", "content": query}]
 
-        input_ids = _llama_guard_tokenizer.apply_chat_template(
-            conversation,
-            return_tensors="pt",
-        ).to(_llama_guard_model.device)
-        attention_mask = input_ids.new_ones(input_ids.shape)
+        if hasattr(_llama_guard_tokenizer, "apply_chat_template"):
+            tokenized = _llama_guard_tokenizer.apply_chat_template(
+                conversation,
+                return_tensors="pt",
+            )
+        else:
+            prompt = f"<|user|>\n{query}\n<|assistant|>"
+            tokenized = _llama_guard_tokenizer(prompt, return_tensors="pt")
+
+        if isinstance(tokenized, dict):
+            input_ids = tokenized["input_ids"].to(_llama_guard_model.device)
+            attention_mask = tokenized.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(_llama_guard_model.device)
+        else:
+            input_ids = tokenized.to(_llama_guard_model.device)
+            attention_mask = None
+
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_ids.shape)
 
         prompt_len = input_ids.shape[1]
         output = _llama_guard_model.generate(
@@ -326,7 +341,11 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
         logger.info("Llama Guard passed query | verdict='%s'", verdict)
         return GuardrailResult(allowed=True, sanitized_text=query)
     except Exception as exc:
-        logger.warning("Llama Guard runtime check failed; falling back to regex checks: %r", exc)
+        logger.warning(
+            "Llama Guard runtime check failed; falling back to regex checks: %r",
+            exc,
+            exc_info=True,
+        )
         return GuardrailResult(allowed=True, sanitized_text=query)
 
 def check_query(query: str) -> GuardrailResult:
