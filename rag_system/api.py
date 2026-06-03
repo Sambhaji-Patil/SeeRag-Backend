@@ -224,6 +224,11 @@ async def require_bearer_token(request: Request, call_next):
 
     auth_header = request.headers.get("authorization", "")
     scheme, _, token = auth_header.partition(" ")
+    
+    if not token and request.query_params.get("token"):
+        scheme = "Bearer"
+        token = request.query_params.get("token")
+        
     if scheme.lower() != "bearer" or not token or not compare_digest(token.strip(), settings.api_bearer_token):
         return JSONResponse(
             status_code=401,

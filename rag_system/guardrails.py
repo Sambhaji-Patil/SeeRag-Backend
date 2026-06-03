@@ -268,13 +268,14 @@ def _check_query_llama_guard(query: str) -> GuardrailResult:
         conversation = [{"role": "user", "content": query}]
 
         if hasattr(_llama_guard_tokenizer, "apply_chat_template"):
-            tokenized = _llama_guard_tokenizer.apply_chat_template(
+            prompt = _llama_guard_tokenizer.apply_chat_template(
                 conversation,
-                return_tensors="pt",
+                tokenize=False,
             )
         else:
             prompt = f"<|user|>\n{query}\n<|assistant|>"
-            tokenized = _llama_guard_tokenizer(prompt, return_tensors="pt")
+            
+        tokenized = _llama_guard_tokenizer(prompt, return_tensors="pt")
 
         if isinstance(tokenized, dict):
             input_ids = tokenized.get("input_ids")
